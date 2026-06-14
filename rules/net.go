@@ -62,12 +62,48 @@ func JoinHostPort(m dsl.Matcher) {
 //
 // See: https://pkg.go.dev/path/filepath#IsLocal
 func FilepathIsLocal(m dsl.Matcher) {
-	// Detect simple .. check that might be replaced by IsLocal
-	// Note: For URL paths, strings.Contains is still appropriate because filepath.IsLocal
-	// cleans paths internally (e.g., "path/../etc" → "etc" → valid).
+	// Detect simple .. check that might be replaced by IsLocal.
+	//
+	// strings.Contains($x, "..") on its own is far too broad: it fires on any
+	// ".." substring test (version ranges, ellipsis checks, arbitrary text), not
+	// just path traversal. There is no type signal that distinguishes a path from
+	// any other string, so this constrains on the operand's name instead: only
+	// flag when the checked expression reads like a path. This trades a little
+	// recall for far fewer false positives; it stays advisory (Report-only).
+	//
+	// Two guards keep this narrow:
+	//
+	//  1. The operand must be a bare identifier (`^[A-Za-z_][A-Za-z0-9_]*$`).
+	//     The name match below runs on the operand's full source text, so without
+	//     this a selector like req.URL.Path would match on "Path" and get flagged,
+	//     even though the message says URL paths are the exception. Restricting to
+	//     a plain local variable both removes that contradiction and targets the
+	//     pattern the rule is really about (a path held in a local var).
+	//
+	//  2. The identifier must read like a path. The match is case-sensitive so it
+	//     keys on Go's camelCase boundaries instead of plain substrings, and BOTH
+	//     alternatives are anchored (`|` has the lowest precedence, so an
+	//     unanchored second branch would match the keyword as a substring of any
+	//     identifier, e.g. MyDirtyVar via "Dir" or IsFiled via "File"):
+	//       - `^(path|dir|file)(s|path|name|[A-Z].*)?$` catches a lowercase
+	//         keyword that is the whole name, a plural, a common lowercase compound
+	//         (filepath, filename, dirname, dirpath), or the first camelCase
+	//         component (fileName, dirEntry, ...).
+	//       - `^(.*[a-z0-9_])?(Path|Dir|File)(s|[A-Z].*)?$` catches a capitalized
+	//         keyword at a camelCase boundary (userPath, srcDir, inputFile), while
+	//         requiring it to sit on a boundary so MyDirtyVar/IsFiled do not match.
+	//     A flat `(?i)path|dir|file` would also fire on words that merely contain
+	//     those letters (profile, directory, redirect, dirty, filed).
+	//
+	// Note: For URL paths, strings.Contains is still appropriate because
+	// filepath.IsLocal cleans paths internally (e.g., "path/../etc" → "etc").
 	m.Match(
 		`strings.Contains($path, "..")`,
 	).
+		Where(
+			m["path"].Text.Matches(`^[A-Za-z_][A-Za-z0-9_]*$`) &&
+				m["path"].Text.Matches(`^(path|dir|file)(s|path|name|[A-Z].*)?$|^(.*[a-z0-9_])?(Path|Dir|File)(s|[A-Z].*)?$`),
+		).
 		Report("consider using filepath.IsLocal($path) for file path validation (Go 1.20+); for URL paths, strings.Contains is appropriate")
 }
 
@@ -133,11 +169,30 @@ func DeprecatedReverseProxyDirector(m dsl.Matcher) {
 //
 // See: https://go.dev/doc/go1.25#compiler (nil check reordering fix)
 func ErrorBeforeUse(m dsl.Matcher) {
-	// os.Open/Create followed by method call before error check
+	// os.Open/Create/OpenFile followed by a use of $f before the error check.
+	// Four result shapes are covered for each constructor:
+	//   - single-value assignment: name := f.Method(...)
+	//   - bare call (return value discarded): f.Method(...)
+	//   - multi-value assignment: a, b := f.Method(...)
+	//   - deferred call: defer f.Method(...) (the classic `defer f.Close()` before
+	//     the err check, which runs on a nil receiver and panics when Open fails)
 	m.Match(
+		// single-value assignment
 		`$f, $err := os.Open($path); $_ := $f.$method($*_); if $err != nil { $*_ }`,
 		`$f, $err := os.Create($path); $_ := $f.$method($*_); if $err != nil { $*_ }`,
 		`$f, $err := os.OpenFile($*_); $_ := $f.$method($*_); if $err != nil { $*_ }`,
+		// bare call
+		`$f, $err := os.Open($path); $f.$method($*_); if $err != nil { $*_ }`,
+		`$f, $err := os.Create($path); $f.$method($*_); if $err != nil { $*_ }`,
+		`$f, $err := os.OpenFile($*_); $f.$method($*_); if $err != nil { $*_ }`,
+		// multi-value assignment
+		`$f, $err := os.Open($path); $_, $_ := $f.$method($*_); if $err != nil { $*_ }`,
+		`$f, $err := os.Create($path); $_, $_ := $f.$method($*_); if $err != nil { $*_ }`,
+		`$f, $err := os.OpenFile($*_); $_, $_ := $f.$method($*_); if $err != nil { $*_ }`,
+		// deferred call
+		`$f, $err := os.Open($path); defer $f.$method($*_); if $err != nil { $*_ }`,
+		`$f, $err := os.Create($path); defer $f.$method($*_); if $err != nil { $*_ }`,
+		`$f, $err := os.OpenFile($*_); defer $f.$method($*_); if $err != nil { $*_ }`,
 	).
 		Report("potential nil pointer: $f may be nil if $err != nil; check error before using $f.$method()")
 }
