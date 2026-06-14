@@ -81,7 +81,24 @@ same directory is refused (`agy_run` returns a conflict error rather than queuin
 them in separate directories or retry once the first finishes. Runs in different directories,
 and runs continuing distinct conversations, still run concurrently up to the configured cap.
 The gate that enforces this is rebuilt at startup from jobs whose supervisor outlived a server
-restart, so the cap and serialization hold across restarts.
+restart, so serialization holds across restarts.
+
+This serialization holds across separate `agy-mcp` processes too, which matters in stdio mode,
+where each MCP client session spawns its own process sharing one `AGY_MCP_STATE_DIR`. A per-key
+advisory lock (`flock` on a file under `<state-dir>/locks/`) serializes same-`cwd`/same-conversation
+runs across processes, so two sibling sessions cannot start a conflicting run concurrently. The
+global concurrency cap, by contrast, is enforced per process: with N client sessions each capped
+at the configured limit, up to N times that many distinct, non-conflicting runs can be in flight.
+The lock files are tiny and left in place by design (unlinking a `flock` file races), so the
+`locks/` directory keeps one empty file per distinct directory or conversation ever locked.
+
+Two caveats. `AGY_MCP_STATE_DIR` must live on a local filesystem that supports `flock` (not NFS,
+where `flock` may be a no-op or fail); a run is refused rather than started if the lock cannot be
+taken, so cross-process exclusion can never silently lapse. And across a server restart there is a
+brief window, while the manager process is down, before it re-takes the locks for jobs whose
+supervisor outlived it; a sibling process that starts the same-`cwd` run during that window is not
+blocked. The in-process gate is always restored at startup, so this gap is limited to the restart
+window itself.
 
 ## HTTP mode
 
