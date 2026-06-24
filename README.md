@@ -9,7 +9,7 @@
 
 An MCP (Model Context Protocol) server that wraps the [Antigravity CLI](https://antigravity.google) (`agy`), so any MCP client (Claude Code, Cursor, Cline, and others) can run `agy` prompts, peer reviews, and follow-up turns as native tools.
 
-> Status: feature complete (stdio and HTTP transports, async and sync job lifecycle, model and session discovery, cross-platform builds) and verified against a live agy (1.0.7).
+> Status: feature complete (stdio and HTTP transports, async and sync job lifecycle, model and session discovery, cross-platform builds) and verified against a live agy (1.0.11).
 
 ## Why
 
@@ -36,11 +36,15 @@ Two transports run the same core:
 
 ## Requirements
 
-- The `agy` binary on `PATH` (or configured explicitly via `AGY_MCP_AGY_PATH`).
+- The `agy` binary on `PATH` (or configured explicitly via `AGY_MCP_AGY_PATH`). agy 1.0.9 or newer is recommended (see the continuation note below).
 - Go 1.26+ to build.
 - The server builds and runs on Linux, macOS, and Windows. Job supervision (running agy as managed jobs via `agy_run` / `agy_run_sync` / `agy_status` / `agy_cancel`) relies on process groups, `/proc`, and the kernel boot id, so it runs on Linux only; on macOS and Windows those tools return a clear "job supervision is only supported on Linux" error, while stdio/HTTP serving, `list_models`, and `list_sessions` work everywhere.
 
 > Note: every job spawns a fresh `agy` process, which on startup launches whatever MCP servers are configured in agy's own `mcp_config.json`. Peer-review and automation runs usually do not need those servers, and a slow or hanging one adds latency to every job. agy 1.0.7+ bounds this with a per-server launch `timeout` (set `-1` to disable it). If startup is slow, give the unneeded servers a `timeout` in agy's `mcp_config.json`, or point agy at a trimmed config.
+
+> Note (continuation): a follow-up turn runs `agy --conversation <id> -p <prompt>`, and the supervisor captures agy's stdout verbatim as the job result with no post-processing. agy 1.0.9 fixed a print-mode resumption bug where a resumed `-p` dumped the entire conversation transcript instead of only the new turn; on earlier builds (through 1.0.7) every continued `conversation_id` / `continue_latest` result was polluted with the full prior transcript. On 1.0.9+ the result is just the new response. Verified clean end-to-end against agy 1.0.11.
+
+> Note (auth): agy-mcp passes its own process environment through to every spawned `agy`, so agy's normal OAuth credentials are used by default. For headless or daemon deployments (HTTP mode, cron) where no browser is available, set `USE_ADC=1` in the server's environment to have agy authenticate via Google Application Default Credentials instead of the interactive sign-in flow (agy 1.0.11+). No agy-mcp flag or code change is needed; unset it to fall back to the other sign-in methods.
 
 ## Install
 

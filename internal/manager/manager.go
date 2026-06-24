@@ -45,13 +45,22 @@ type Manager struct {
 	// liveness watcher. Fields (not package globals) so tests stay isolated and can
 	// run in parallel. agy's conversation cache is flushed by a separate daemon that
 	// can lag the foreground agy exit, so the capture retries briefly. Verified
-	// against agy 1.0.7: agy rewrites last_conversations.json in place (O_TRUNC, no
-	// file lock), so a concurrent read can be torn; loadCache reports torn reads
+	// against agy 1.0.7 and re-verified against 1.0.11: agy rewrites
+	// last_conversations.json in place (O_TRUNC, no file lock), so a concurrent
+	// read can be torn; loadCache reports torn reads
 	// as errors, capture treats them as "no capture yet" and this retry loop
 	// re-reads, and StartJob disables capture when the pre-run snapshot itself is
 	// unreadable, so no mutex is needed. agy also ignores a caller-supplied fresh --conversation UUID and
 	// mints its own, which is why the id must be captured by diffing the cache
 	// rather than generated and passed in.
+	//
+	// Watch item: this whole mechanism depends on agy continuing to maintain
+	// last_conversations.json as a cwd->uuid map. agy has been migrating its
+	// conversation store toward SQLite (1.0.4 made .db "the CLI's conversation
+	// format"; 1.0.8 added .db/.db-wal scanning to /resume). The JSON file is
+	// still written as of 1.0.11, but if a future agy drops it for a SQLite-only
+	// store, captureNewUUID silently stops finding ids and continuation breaks.
+	// Revisit loadCache/captureNewUUID against the cache format on each agy bump.
 	captureBudget        time.Duration
 	capturePoll          time.Duration
 	restoredPollInterval time.Duration
