@@ -1,3 +1,5 @@
+//go:build linux || darwin
+
 package manager
 
 import (
@@ -16,8 +18,9 @@ import (
 // other GC test uses dead metas, so a regression that dropped the liveness
 // check would pass them; this one needs a real, live process to catch it.
 func TestGarbageCollectKeepsExpiredButAliveJob(t *testing.T) {
-	// processAlive matches the target's /proc comm against the supervisor
-	// basename, so stand in "sleep" as the supervisor.
+	// processAlive pins liveness by the recorded start time (set below), so any
+	// real, live process stands in as the supervisor. SupervisorExe feeds only
+	// the Linux comm fallback, which a recorded start time bypasses.
 	m := New(config.Config{StateDir: t.TempDir(), MaxConcurrency: 4, JobTTL: time.Hour, SupervisorExe: "sleep"})
 
 	cmd := exec.Command("sleep", "30")
@@ -31,11 +34,16 @@ func TestGarbageCollectKeepsExpiredButAliveJob(t *testing.T) {
 	}()
 
 	// Expired (StartedAt well before the TTL cutoff) but its supervisor is alive.
+	startTicks, ok := readStartTimeTicks(cmd.Process.Pid)
+	if !ok {
+		t.Fatal("readStartTimeTicks(target) failed")
+	}
 	if _, err := m.store.Create(jobstore.Meta{
-		ID:        "alive",
-		PID:       cmd.Process.Pid,
-		BootID:    readBootID(),
-		StartedAt: time.Now().Add(-2 * time.Hour),
+		ID:             "alive",
+		PID:            cmd.Process.Pid,
+		BootID:         readBootID(),
+		StartTimeTicks: startTicks,
+		StartedAt:      time.Now().Add(-2 * time.Hour),
 	}); err != nil {
 		t.Fatal(err)
 	}

@@ -1,3 +1,5 @@
+//go:build linux || darwin
+
 package manager
 
 import (
@@ -10,8 +12,9 @@ import (
 )
 
 func TestCancelSignalsSupervisor(t *testing.T) {
-	// The liveness guard requires the target's /proc comm to match the
-	// configured supervisor basename, so stand in "sleep" as the supervisor.
+	// processAlive pins liveness by the recorded start time (set below), so any
+	// real, signalable process stands in as the supervisor. SupervisorExe feeds
+	// only the Linux comm fallback, which a recorded start time bypasses.
 	m := New(config.Config{StateDir: t.TempDir(), MaxConcurrency: 4, SupervisorExe: "sleep"})
 
 	// Spawn a real sleeper process we can signal.
@@ -24,8 +27,12 @@ func TestCancelSignalsSupervisor(t *testing.T) {
 		_ = cmd.Wait()
 	}()
 
+	startTicks, ok := readStartTimeTicks(cmd.Process.Pid)
+	if !ok {
+		t.Fatal("readStartTimeTicks(target) failed")
+	}
 	if _, err := m.store.Create(jobstore.Meta{
-		ID: "j", PID: cmd.Process.Pid, BootID: readBootID(), StartedAt: time.Now(),
+		ID: "j", PID: cmd.Process.Pid, BootID: readBootID(), StartTimeTicks: startTicks, StartedAt: time.Now(),
 	}); err != nil {
 		t.Fatal(err)
 	}
