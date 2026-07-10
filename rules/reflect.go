@@ -29,7 +29,9 @@ func ReflectTypeAssert(m dsl.Matcher) {
 		Report("use reflect.TypeAssert[$typ]($v) instead of $v.Interface().($typ) to avoid allocation (Go 1.25+)")
 }
 
-// ReflectPtrTo detects deprecated reflect.PtrTo and suggests reflect.PointerTo.
+// DeprecatedReflectPtrTo detects deprecated reflect.PtrTo and suggests
+// reflect.PointerTo. Named with the Deprecated* prefix for consistency with
+// this package's other stdlib-deprecation matchers (crypto.go, net.go).
 //
 // Deprecated pattern:
 //
@@ -42,7 +44,7 @@ func ReflectTypeAssert(m dsl.Matcher) {
 // reflect.PtrTo was deprecated in Go 1.22 in favor of the clearer name PointerTo.
 //
 // See: https://pkg.go.dev/reflect#PointerTo
-func ReflectPtrTo(m dsl.Matcher) {
+func DeprecatedReflectPtrTo(m dsl.Matcher) {
 	m.Match(
 		`reflect.PtrTo($t)`,
 	).
@@ -50,85 +52,17 @@ func ReflectPtrTo(m dsl.Matcher) {
 		Suggest("reflect.PointerTo($t)")
 }
 
-// ReflectTypeOf detects the common pattern of getting a reflect.Type via TypeOf
-// with a nil pointer and suggests using the cleaner reflect.TypeFor generic.
-//
-// Old pattern:
-//
-//	t := reflect.TypeOf((*MyType)(nil)).Elem()
-//
-// New pattern (Go 1.22+):
-//
-//	t := reflect.TypeFor[MyType]()
-//
-// Benefits:
-//   - More readable and concise
-//   - No need for nil pointer cast trick
-//   - Type is checked at compile time
-//
-// See: https://pkg.go.dev/reflect#TypeFor
-func ReflectTypeOf(m dsl.Matcher) {
-	// Autofix is safe here: the rewrite stays inside the reflect package, which
-	// the matched expression already imports, so --fix cannot leave a dangling
-	// reference (unlike rewrites that introduce a new import).
-	m.Match(
-		`reflect.TypeOf((*$typ)(nil)).Elem()`,
-	).
-		Report("use reflect.TypeFor[$typ]() instead of reflect.TypeOf((*$typ)(nil)).Elem() (Go 1.22+)").
-		Suggest("reflect.TypeFor[$typ]()")
-}
-
-// DeprecatedReflectHeaders detects deprecated reflect.SliceHeader and
-// reflect.StringHeader usage and suggests using unsafe.Slice/unsafe.String.
-//
-// Deprecated patterns:
-//
-//	sh := (*reflect.SliceHeader)(unsafe.Pointer(&slice))
-//	hdr := (*reflect.StringHeader)(unsafe.Pointer(&str))
-//
-// New patterns (Go 1.21+):
-//
-//	// For creating slices from pointers:
-//	slice := unsafe.Slice(ptr, len)
-//
-//	// For creating strings from pointers:
-//	str := unsafe.String(ptr, len)
-//
-// Benefits:
-//   - Type-safe
-//   - No need for manual header manipulation
-//   - Less error-prone
-//
-// See: https://pkg.go.dev/unsafe#Slice
-// See: https://pkg.go.dev/unsafe#String
-func DeprecatedReflectHeaders(m dsl.Matcher) {
-	// `{$*_}` matches zero or more fields, so it already covers the empty `{}`
-	// literal; a separate `{}` clause would be dead weight.
-	m.Match(
-		`reflect.SliceHeader{$*_}`,
-	).
-		Report("reflect.SliceHeader is deprecated in Go 1.21; use unsafe.Slice instead")
-
-	m.Match(
-		`reflect.StringHeader{$*_}`,
-	).
-		Report("reflect.StringHeader is deprecated in Go 1.21; use unsafe.String instead")
-
-	// Casting to SliceHeader
-	m.Match(
-		`(*reflect.SliceHeader)($x)`,
-	).
-		Report("reflect.SliceHeader is deprecated in Go 1.21; use unsafe.Slice instead")
-
-	// Casting to StringHeader
-	m.Match(
-		`(*reflect.StringHeader)($x)`,
-	).
-		Report("reflect.StringHeader is deprecated in Go 1.21; use unsafe.String instead")
-}
-
 // ReflectFieldsIterator detects manual index-based iteration over struct fields
 // and suggests using the iterator methods added in Go 1.26.
+//
+// Kept deliberately duplicating modernize's stditerators analyzer for the
+// single-target case (see rules/doc.go): verified stditerators silently
+// declines to fire at all on the common "parallel Type+Value indexed access"
+// pattern below (sf := t.Field(i); vf := val.Field(i), same i), rather than
+// risking an unsafe fused rewrite. This rule still fires unconditionally on
+// any Type/Value.NumField loop, parallel-access or not, so it is the only
+// remaining signal for that pattern; the tradeoff is losing the
+// uniq-by-line lottery to stditerators' autofix on the simple case.
 //
 // Old pattern:
 //
@@ -186,6 +120,10 @@ func ReflectFieldsIterator(m dsl.Matcher) {
 // ReflectMethodsIterator detects manual index-based iteration over type methods
 // and suggests using the iterator methods added in Go 1.26.
 //
+// Kept deliberately for the identical reason as ReflectFieldsIterator above:
+// modernize's stditerators declines to fire on the parallel Type+Value
+// indexed access pattern (m := t.Method(i); v := val.Method(i), same i).
+//
 // Old pattern:
 //
 //	for i := 0; i < t.NumMethod(); i++ {
@@ -236,62 +174,4 @@ func ReflectMethodsIterator(m dsl.Matcher) {
 	).
 		Where(m["v"].Type.Is("reflect.Value")).
 		Report("use range $v.Methods() instead of range $v.NumMethod() (Go 1.26+)")
-}
-
-// ReflectInsOutsIterator detects manual index-based iteration over function
-// input and output parameters and suggests using the iterators added in Go 1.26.
-//
-// Old patterns:
-//
-//	for i := 0; i < t.NumIn(); i++ {
-//	    param := t.In(i)
-//	    // use param
-//	}
-//	for i := 0; i < t.NumOut(); i++ {
-//	    ret := t.Out(i)
-//	    // use ret
-//	}
-//
-// New patterns (Go 1.26+):
-//
-//	for param := range t.Ins() {
-//	    // use param
-//	}
-//	for ret := range t.Outs() {
-//	    // use ret
-//	}
-//
-// Benefits:
-//   - Cleaner, more idiomatic Go iteration
-//   - Consistent with Fields() and Methods() iterators
-//
-// See: https://pkg.go.dev/reflect#Type.Ins
-// See: https://pkg.go.dev/reflect#Type.Outs
-func ReflectInsOutsIterator(m dsl.Matcher) {
-	// NumIn loop
-	m.Match(
-		`for $i := 0; $i < $t.NumIn(); $i++ { $*_ }`,
-	).
-		Where(m["t"].Type.Is("reflect.Type")).
-		Report("use range $t.Ins() instead of index-based input parameter iteration (Go 1.26+)")
-
-	// NumOut loop
-	m.Match(
-		`for $i := 0; $i < $t.NumOut(); $i++ { $*_ }`,
-	).
-		Where(m["t"].Type.Is("reflect.Type")).
-		Report("use range $t.Outs() instead of index-based output parameter iteration (Go 1.26+)")
-
-	// range over NumIn/NumOut integer
-	m.Match(
-		`for $i := range $t.NumIn() { $*_ }`,
-	).
-		Where(m["t"].Type.Is("reflect.Type")).
-		Report("use range $t.Ins() instead of range $t.NumIn() (Go 1.26+)")
-
-	m.Match(
-		`for $i := range $t.NumOut() { $*_ }`,
-	).
-		Where(m["t"].Type.Is("reflect.Type")).
-		Report("use range $t.Outs() instead of range $t.NumOut() (Go 1.26+)")
 }
