@@ -105,7 +105,10 @@ func TestFreshRunNoConversationReleasesKey(t *testing.T) {
 
 	// Wait for the job to finish; the id stays empty (no conversation was created).
 	testutil.WaitFor(t, 2*time.Second, func() bool {
-		st, _ := m.Status(job.ID)
+		st, err := m.Status(job.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
 		if st.State != StateDone {
 			return false
 		}
@@ -116,12 +119,19 @@ func TestFreshRunNoConversationReleasesKey(t *testing.T) {
 	}, "job never reached done state")
 
 	// The gate key must have been released after the capture budget: a second
-	// same-cwd fresh run eventually succeeds.
+	// same-cwd fresh run eventually succeeds. Any error other than a known
+	// retryable gate refusal is a genuine bug, not something to retry through.
 	var job2 Job
 	testutil.WaitFor(t, 2*time.Second, func() bool {
 		var err error
 		job2, err = m.StartJob(StartRequest{Prompt: "again", Cwd: cwd})
-		return err == nil
+		if err == nil {
+			return true
+		}
+		if !isRetryableGateRefusal(err) {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		return false
 	}, "gate key was not released after a fresh run that created no conversation")
 	// Wait for the second job's supervisor to finish before returning. It writes
 	// into StateDir (a t.TempDir), and a still-running supervisor races the TempDir
@@ -294,7 +304,16 @@ func waitForCapturedID(t *testing.T, m *Manager, id string, within time.Duration
 	testutil.WaitFor(t, within, func() bool {
 		var err error
 		st, err = m.Status(id)
-		return err == nil && st.State == StateDone && st.ConversationID != ""
+		if err != nil {
+			t.Fatal(err)
+		}
+		// The job is done and the capture goroutine has settled (armed pending
+		// cleared) with no id: that outcome is final, not something more waiting
+		// would change, so fail fast instead of burning the rest of the timeout.
+		if st.State == StateDone && !m.CapturePending(id) && st.ConversationID == "" {
+			t.Fatal("job finished and capture settled, but no conversation id was captured")
+		}
+		return st.State == StateDone && st.ConversationID != ""
 	}, fmt.Sprintf("job %s never captured a conversation id within %s", id, within))
 	return st
 }

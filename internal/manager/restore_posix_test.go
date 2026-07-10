@@ -130,10 +130,18 @@ func TestRestoreGateReleasesKeyWhenSupervisorExits(t *testing.T) {
 	_ = cmd.Wait()
 	reaped = true
 
-	// The watcher must release the key; a same-cwd run then succeeds.
+	// The watcher must release the key; a same-cwd run then succeeds. Any error
+	// other than a known retryable gate refusal is a genuine bug, not something
+	// to retry through.
 	testutil.WaitFor(t, 2*time.Second, func() bool {
 		_, err := m.StartJob(StartRequest{Prompt: "x", Cwd: cwd})
-		return err == nil
+		if err == nil {
+			return true
+		}
+		if !isRetryableGateRefusal(err) {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		return false
 	}, "watcher did not release the restored key after the supervisor exited")
 }
 
