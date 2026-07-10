@@ -4,29 +4,57 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"testing"
 	"time"
 )
 
+// assertIDRejected checks that every id-taking Store method refuses id.
+func assertIDRejected(t *testing.T, s *Store, id string) {
+	t.Helper()
+	if _, err := s.Create(Meta{ID: id}); !errors.Is(err, ErrInvalidID) {
+		t.Errorf("Create(%q) err = %v, want ErrInvalidID", id, err)
+	}
+	if _, err := s.Load(id); !errors.Is(err, ErrInvalidID) {
+		t.Errorf("Load(%q) err = %v, want ErrInvalidID", id, err)
+	}
+	if err := s.Remove(id); !errors.Is(err, ErrInvalidID) {
+		t.Errorf("Remove(%q) err = %v, want ErrInvalidID", id, err)
+	}
+	if _, err := s.Dir(id); !errors.Is(err, ErrInvalidID) {
+		t.Errorf("Dir(%q) err = %v, want ErrInvalidID", id, err)
+	}
+	if _, ok := s.ExitCode(id); ok {
+		t.Errorf("ExitCode(%q) ok = true, want false", id)
+	}
+}
+
 func TestRejectsUnsafeJobID(t *testing.T) {
 	s := New(t.TempDir())
-	for _, id := range []string{"", ".", "..", "../escape", "a/b", `a\b`} {
-		if _, err := s.Create(Meta{ID: id}); !errors.Is(err, ErrInvalidID) {
-			t.Errorf("Create(%q) err = %v, want ErrInvalidID", id, err)
-		}
-		if _, err := s.Load(id); !errors.Is(err, ErrInvalidID) {
-			t.Errorf("Load(%q) err = %v, want ErrInvalidID", id, err)
-		}
-		if err := s.Remove(id); !errors.Is(err, ErrInvalidID) {
-			t.Errorf("Remove(%q) err = %v, want ErrInvalidID", id, err)
-		}
-		if _, err := s.Dir(id); !errors.Is(err, ErrInvalidID) {
-			t.Errorf("Dir(%q) err = %v, want ErrInvalidID", id, err)
-		}
-		if _, ok := s.ExitCode(id); ok {
-			t.Errorf("ExitCode(%q) ok = true, want false", id)
-		}
+	// Trailing-dot/space ids are rejected on every platform because Win32 path
+	// normalization strips them per component: "job1." aliases job1's directory
+	// and ".. " normalizes to the parent-traversal "..".
+	for _, id := range []string{"", ".", "..", "../escape", "a/b", `a\b`, "job1.", "job1 ", ".. ", "..."} {
+		assertIDRejected(t, s, id)
+	}
+}
+
+// TestRejectsWindowsReservedJobID locks in the filepath.IsLocal layer of
+// validJobID: a bare reserved device name addresses the console or a port
+// device rather than a directory, so it must never be accepted as a job id.
+// filepath.IsLocal is platform-dependent (these names are harmless on Unix
+// filesystems and pass there), so the test runs on Windows only. Extension
+// forms like "CON.txt" are deliberately not asserted: since Windows 11 they
+// are no longer reserved and Go defers to RtlIsDosDeviceName_U, so the result
+// is OS-version-dependent.
+func TestRejectsWindowsReservedJobID(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("filepath.IsLocal rejects reserved device names and colon forms only on Windows")
+	}
+	s := New(t.TempDir())
+	for _, id := range []string{"CON", "con", "NUL", "PRN", "AUX", "COM1", "lpt9", "foo:bar"} {
+		assertIDRejected(t, s, id)
 	}
 }
 

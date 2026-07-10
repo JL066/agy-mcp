@@ -155,13 +155,25 @@ func (s *Store) jobDir(id string) string { return filepath.Join(s.root, id) }
 
 // validJobID reports whether id is a safe single path segment, with no path
 // separators or parent-directory traversal, so it can never escape the store
-// root when joined into a filesystem path. Server-generated ids always pass;
-// this guards against a malicious client-supplied job_id reaching the store.
+// root when joined into a filesystem path. filepath.IsLocal layers on the
+// platform-specific hazards a hand-rolled check misses: on Windows it rejects
+// reserved device names (CON, NUL, COM1, ...) and any colon form (drive-relative
+// "C:foo", NTFS alternate data stream "foo:bar"). Trailing dots and spaces are
+// rejected explicitly (IsLocal allows them): Win32 path normalization strips
+// them per component, so "job1." would alias job1's directory on Windows.
+// Server-generated ids always pass; this guards against a malicious
+// client-supplied job_id reaching the store.
 func validJobID(id string) bool {
 	if id == "" || id == "." || id == ".." {
 		return false
 	}
 	if strings.ContainsAny(id, `/\`) {
+		return false
+	}
+	if !filepath.IsLocal(id) {
+		return false
+	}
+	if strings.HasSuffix(id, ".") || strings.HasSuffix(id, " ") {
 		return false
 	}
 	return filepath.Base(id) == id
