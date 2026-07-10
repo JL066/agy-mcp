@@ -4,7 +4,12 @@ package gorules
 
 import "github.com/quasilyte/go-ruleguard/dsl"
 
-// JoinHostPort detects fmt.Sprintf patterns for host:port and suggests net.JoinHostPort.
+// JoinHostPort detects fmt.Sprintf patterns for a bare host:port and suggests
+// net.JoinHostPort. Kept alongside the stock nosprintfhostport linter rather
+// than being superseded by it: nosprintfhostport's upstream analyzer only
+// matches a scheme-prefixed URL ("scheme://%s:..."), never the bare
+// "%s:%d"/"%v:%d" form this rule targets (verified empirically), which is the
+// common case for building a raw net.Dial/net.Listen/http.Server.Addr address.
 //
 // The old pattern:
 //
