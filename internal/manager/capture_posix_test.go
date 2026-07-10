@@ -10,7 +10,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/tphakala/agy-mcp/internal/config"
 	"github.com/tphakala/agy-mcp/internal/jobstore"
 	"github.com/tphakala/agy-mcp/internal/testutil"
 )
@@ -18,7 +17,6 @@ import (
 // A completed fresh run must report the conversation id agy created for it,
 // captured by diffing the conversation cache against the pre-run snapshot.
 func TestFreshRunCapturesConversationID(t *testing.T) {
-	state := t.TempDir()
 	cachePath := filepath.Join(t.TempDir(), "last_conversations.json")
 	if err := os.WriteFile(cachePath, []byte(`{}`), 0o644); err != nil {
 		t.Fatal(err)
@@ -33,16 +31,14 @@ func TestFreshRunCapturesConversationID(t *testing.T) {
 	}
 	const newUUID = "11111111-2222-3333-4444-555555555555"
 
-	c := config.Config{
-		AgyPath: "/usr/bin/agy",
-		SupervisorExe: testutil.WriteFakeSupervisor(t, testutil.FakeSupervisor{
+	m := newManager(t, managerOpts{
+		agyPath: "/usr/bin/agy",
+		supervisorExe: testutil.WriteFakeSupervisor(t, testutil.FakeSupervisor{
 			Out: "done", CachePath: cachePath, CacheJSON: fmt.Sprintf(`{%q:%q}`, cwd, newUUID),
 		}),
-		StateDir:       state,
-		DefaultTimeout: time.Minute,
-		MaxConcurrency: 4,
-	}
-	m := New(c)
+		defaultTimeout: time.Minute,
+		maxConcurrency: 4,
+	})
 	m.cacheFile = cachePath
 
 	job, err := m.StartJob(StartRequest{Prompt: "hi", Cwd: cwd})
@@ -53,10 +49,8 @@ func TestFreshRunCapturesConversationID(t *testing.T) {
 		t.Fatalf("fresh run should start with no conversation id, got %q", job.ConversationID)
 	}
 
+	// waitForCapturedID's postcondition already guarantees st.State == StateDone.
 	st := waitForCapturedID(t, m, job.ID, 3*time.Second)
-	if st.State != StateDone {
-		t.Fatalf("state = %q, want done", st.State)
-	}
 	if st.ConversationID != newUUID {
 		t.Fatalf("captured conversation id = %q, want %q", st.ConversationID, newUUID)
 	}
@@ -81,32 +75,25 @@ func TestFreshRunCapturesConversationID(t *testing.T) {
 // StateDir races the TempDir RemoveAll cleanup.
 func waitForExitCode(t *testing.T, m *Manager, id string) {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if _, ok := m.store.ExitCode(id); ok {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatalf("job %s never wrote exit_code", id)
+	testutil.WaitFor(t, 2*time.Second, func() bool {
+		_, ok := m.store.ExitCode(id)
+		return ok
+	}, fmt.Sprintf("job %s never wrote exit_code", id))
 }
 
 func TestFreshRunNoConversationReleasesKey(t *testing.T) {
-	state := t.TempDir()
 	cachePath := filepath.Join(t.TempDir(), "last_conversations.json")
 	if err := os.WriteFile(cachePath, []byte(`{}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	cwd := t.TempDir()
 
-	c := config.Config{
-		AgyPath:        "/usr/bin/agy",
-		SupervisorExe:  testutil.WriteFakeSupervisor(t, testutil.FakeSupervisor{Out: "done"}), // writes out + exit 0, never touches the cache
-		StateDir:       state,
-		DefaultTimeout: time.Minute,
-		MaxConcurrency: 4,
-	}
-	m := New(c)
+	m := newManager(t, managerOpts{
+		agyPath:        "/usr/bin/agy",
+		supervisorExe:  testutil.WriteFakeSupervisor(t, testutil.FakeSupervisor{Out: "done"}), // writes out + exit 0, never touches the cache
+		defaultTimeout: time.Minute,
+		maxConcurrency: 4,
+	})
 	m.cacheFile = cachePath
 	m.captureBudget = 50 * time.Millisecond
 	m.capturePoll = 10 * time.Millisecond
@@ -117,39 +104,29 @@ func TestFreshRunNoConversationReleasesKey(t *testing.T) {
 	}
 
 	// Wait for the job to finish; the id stays empty (no conversation was created).
-	deadline := time.Now().Add(2 * time.Second)
-	seenDone := false
-	for time.Now().Before(deadline) {
-		if st, _ := m.Status(job.ID); st.State == StateDone {
-			if st.ConversationID != "" {
-				t.Fatalf("expected empty conversation id, got %q", st.ConversationID)
-			}
-			seenDone = true
-			break
+	testutil.WaitFor(t, 2*time.Second, func() bool {
+		st, _ := m.Status(job.ID)
+		if st.State != StateDone {
+			return false
 		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	if !seenDone {
-		t.Fatal("job never reached done state")
-	}
+		if st.ConversationID != "" {
+			t.Fatalf("expected empty conversation id, got %q", st.ConversationID)
+		}
+		return true
+	}, "job never reached done state")
 
 	// The gate key must have been released after the capture budget: a second
 	// same-cwd fresh run eventually succeeds.
-	deadline = time.Now().Add(2 * time.Second)
-	for {
-		job2, err := m.StartJob(StartRequest{Prompt: "again", Cwd: cwd})
-		if err == nil {
-			// Wait for the second job's supervisor to finish before returning. It writes
-			// into StateDir (a t.TempDir), and a still-running supervisor races the TempDir
-			// RemoveAll cleanup ("directory not empty"). Waiting for exit removes the racer.
-			waitForExitCode(t, m, job2.ID)
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("gate key was not released after a fresh run that created no conversation")
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	var job2 Job
+	testutil.WaitFor(t, 2*time.Second, func() bool {
+		var err error
+		job2, err = m.StartJob(StartRequest{Prompt: "again", Cwd: cwd})
+		return err == nil
+	}, "gate key was not released after a fresh run that created no conversation")
+	// Wait for the second job's supervisor to finish before returning. It writes
+	// into StateDir (a t.TempDir), and a still-running supervisor races the TempDir
+	// RemoveAll cleanup ("directory not empty"). Waiting for exit removes the racer.
+	waitForExitCode(t, m, job2.ID)
 }
 
 // If the manager dies after a fresh run completes but before its completion
@@ -164,12 +141,12 @@ func TestStatusLazilyCapturesConversationID(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	m := New(config.Config{
-		AgyPath:        "/usr/bin/agy",
-		SupervisorExe:  "/bin/true",
-		StateDir:       state,
-		DefaultTimeout: time.Minute,
-		MaxConcurrency: 4,
+	m := newManager(t, managerOpts{
+		agyPath:        "/usr/bin/agy",
+		supervisorExe:  "/bin/true",
+		stateDir:       state,
+		defaultTimeout: time.Minute,
+		maxConcurrency: 4,
 	})
 	m.cacheFile = cachePath
 
@@ -224,12 +201,12 @@ func TestStatusLazyCaptureNoOpWhenCacheUnchanged(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	m := New(config.Config{
-		AgyPath:        "/usr/bin/agy",
-		SupervisorExe:  "/bin/true",
-		StateDir:       state,
-		DefaultTimeout: time.Minute,
-		MaxConcurrency: 4,
+	m := newManager(t, managerOpts{
+		agyPath:        "/usr/bin/agy",
+		supervisorExe:  "/bin/true",
+		stateDir:       state,
+		defaultTimeout: time.Minute,
+		maxConcurrency: 4,
 	})
 	m.cacheFile = cachePath
 
@@ -271,14 +248,13 @@ func TestFreshRunWithCorruptCacheDisablesCapture(t *testing.T) {
 	}
 	cwd := t.TempDir()
 
-	c := config.Config{
-		AgyPath:        "/usr/bin/agy",
-		SupervisorExe:  testutil.WriteFakeSupervisor(t, testutil.FakeSupervisor{Out: "done"}),
-		StateDir:       state,
-		DefaultTimeout: time.Minute,
-		MaxConcurrency: 4,
-	}
-	m := New(c)
+	m := newManager(t, managerOpts{
+		agyPath:        "/usr/bin/agy",
+		supervisorExe:  testutil.WriteFakeSupervisor(t, testutil.FakeSupervisor{Out: "done"}),
+		stateDir:       state,
+		defaultTimeout: time.Minute,
+		maxConcurrency: 4,
+	})
 	m.cacheFile = cachePath
 	m.captureBudget = 50 * time.Millisecond
 	m.capturePoll = 10 * time.Millisecond
@@ -314,23 +290,18 @@ func TestFreshRunWithCorruptCacheDisablesCapture(t *testing.T) {
 
 func waitForCapturedID(t *testing.T, m *Manager, id string, within time.Duration) Status {
 	t.Helper()
-	deadline := time.Now().Add(within)
 	var st Status
-	for time.Now().Before(deadline) {
+	testutil.WaitFor(t, within, func() bool {
 		var err error
 		st, err = m.Status(id)
-		if err == nil && st.State == StateDone && st.ConversationID != "" {
-			return st
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+		return err == nil && st.State == StateDone && st.ConversationID != ""
+	}, fmt.Sprintf("job %s never captured a conversation id within %s", id, within))
 	return st
 }
 
 // CapturePending must be armed synchronously by a fresh StartJob and settle
 // once the completion goroutine has captured (or given up on) the id.
 func TestCapturePendingSettles(t *testing.T) {
-	state := t.TempDir()
 	cachePath := filepath.Join(t.TempDir(), "last_conversations.json")
 	if err := os.WriteFile(cachePath, []byte(`{}`), 0o644); err != nil {
 		t.Fatal(err)
@@ -344,16 +315,14 @@ func TestCapturePendingSettles(t *testing.T) {
 	}
 	const newUUID = "55556666-7777-8888-9999-000011112222"
 
-	c := config.Config{
-		AgyPath: "/usr/bin/agy",
-		SupervisorExe: testutil.WriteFakeSupervisor(t, testutil.FakeSupervisor{
+	m := newManager(t, managerOpts{
+		agyPath: "/usr/bin/agy",
+		supervisorExe: testutil.WriteFakeSupervisor(t, testutil.FakeSupervisor{
 			Out: "done", CachePath: cachePath, CacheJSON: fmt.Sprintf(`{%q:%q}`, cwd, newUUID),
 		}),
-		StateDir:       state,
-		DefaultTimeout: time.Minute,
-		MaxConcurrency: 4,
-	}
-	m := New(c)
+		defaultTimeout: time.Minute,
+		maxConcurrency: 4,
+	})
 	m.cacheFile = cachePath
 
 	job, err := m.StartJob(StartRequest{Prompt: "hi", Cwd: cwd})
@@ -368,13 +337,9 @@ func TestCapturePendingSettles(t *testing.T) {
 	if st.ConversationID != newUUID {
 		t.Fatalf("captured id = %q, want %q", st.ConversationID, newUUID)
 	}
-	deadline := time.Now().Add(2 * time.Second)
-	for m.CapturePending(job.ID) {
-		if time.Now().After(deadline) {
-			t.Fatal("capture never settled after the id was captured")
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	testutil.WaitFor(t, 2*time.Second, func() bool {
+		return !m.CapturePending(job.ID)
+	}, "capture never settled after the id was captured")
 }
 
 // A lazily captured id must not be stolen from a later same-cwd run: when
@@ -389,12 +354,12 @@ func TestStatusLazyCaptureSkipsWhenLaterRunExists(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	m := New(config.Config{
-		AgyPath:        "/usr/bin/agy",
-		SupervisorExe:  "/bin/true",
-		StateDir:       state,
-		DefaultTimeout: time.Minute,
-		MaxConcurrency: 4,
+	m := newManager(t, managerOpts{
+		agyPath:        "/usr/bin/agy",
+		supervisorExe:  "/bin/true",
+		stateDir:       state,
+		defaultTimeout: time.Minute,
+		maxConcurrency: 4,
 	})
 	m.cacheFile = cachePath
 
@@ -465,12 +430,12 @@ func TestStatusLazyCaptureSkipsButDoesNotSettleOnListError(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	m := New(config.Config{
-		AgyPath:        "/usr/bin/agy",
-		SupervisorExe:  "/bin/true",
-		StateDir:       state,
-		DefaultTimeout: time.Minute,
-		MaxConcurrency: 4,
+	m := newManager(t, managerOpts{
+		agyPath:        "/usr/bin/agy",
+		supervisorExe:  "/bin/true",
+		stateDir:       state,
+		defaultTimeout: time.Minute,
+		maxConcurrency: 4,
 	})
 	m.cacheFile = cachePath
 	fls := &failListStore{jobStore: m.store}
@@ -533,12 +498,12 @@ func TestStatusLazyCaptureSettlesAfterHorizon(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	m := New(config.Config{
-		AgyPath:        "/usr/bin/agy",
-		SupervisorExe:  "/bin/true",
-		StateDir:       state,
-		DefaultTimeout: time.Minute,
-		MaxConcurrency: 4,
+	m := newManager(t, managerOpts{
+		agyPath:        "/usr/bin/agy",
+		supervisorExe:  "/bin/true",
+		stateDir:       state,
+		defaultTimeout: time.Minute,
+		maxConcurrency: 4,
 	})
 	m.cacheFile = cachePath
 
@@ -585,12 +550,12 @@ func TestStatusLazyCaptureSettlesViaFallbackHorizonWhenTimeoutZero(t *testing.T)
 		t.Fatal(err)
 	}
 
-	m := New(config.Config{
-		AgyPath:        "/usr/bin/agy",
-		SupervisorExe:  "/bin/true",
-		StateDir:       state,
-		DefaultTimeout: time.Minute,
-		MaxConcurrency: 4,
+	m := newManager(t, managerOpts{
+		agyPath:        "/usr/bin/agy",
+		supervisorExe:  "/bin/true",
+		stateDir:       state,
+		defaultTimeout: time.Minute,
+		maxConcurrency: 4,
 	})
 	m.cacheFile = cachePath
 

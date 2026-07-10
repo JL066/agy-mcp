@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/tphakala/agy-mcp/internal/config"
 	"github.com/tphakala/agy-mcp/internal/jobstore"
+	"github.com/tphakala/agy-mcp/internal/testutil"
 )
 
 // reReadExitStore reports "no sentinel" on the first ExitCode(id) call and
@@ -32,7 +32,7 @@ func (r *reReadExitStore) ExitCode(id string) (int, bool) {
 }
 
 func TestGarbageCollectReapsExpiredOrphanDir(t *testing.T) {
-	m := New(config.Config{StateDir: t.TempDir(), MaxConcurrency: 4, JobTTL: time.Hour})
+	m := newManager(t, managerOpts{maxConcurrency: 4, jobTTL: time.Hour})
 	// A job dir with no meta.json: a crash between Create's MkdirAll and its meta
 	// write, or a partial RemoveAll. Load fails on it, so the old GC skipped it
 	// forever and orphan dirs accumulated without bound.
@@ -60,7 +60,7 @@ func TestGarbageCollectReapsExpiredOrphanDir(t *testing.T) {
 }
 
 func TestGarbageCollectKeepsRecentOrphanDir(t *testing.T) {
-	m := New(config.Config{StateDir: t.TempDir(), MaxConcurrency: 4, JobTTL: time.Hour})
+	m := newManager(t, managerOpts{maxConcurrency: 4, jobTTL: time.Hour})
 	// A meta-less dir younger than the TTL may be a job mid-Create (MkdirAll done,
 	// meta write pending), so it must not be reaped.
 	dir, err := m.store.Dir("fresh-orphan")
@@ -83,7 +83,7 @@ func TestGarbageCollectKeepsRecentOrphanDir(t *testing.T) {
 }
 
 func TestGarbageCollectKeepsExpiredJobWithUnreadableMeta(t *testing.T) {
-	m := New(config.Config{StateDir: t.TempDir(), MaxConcurrency: 4, JobTTL: time.Hour})
+	m := newManager(t, managerOpts{maxConcurrency: 4, jobTTL: time.Hour})
 	// meta.json is present but unparseable (a transient read error, or a legacy
 	// corrupt write). This is NOT an orphan: only a genuinely missing meta.json is.
 	// A valid long-running job's dir mtime is old because writing to out/err does
@@ -116,7 +116,7 @@ func TestGarbageCollectKeepsExpiredJobWithUnreadableMeta(t *testing.T) {
 }
 
 func TestGarbageCollectKeepsTerminalJobWithCapturePending(t *testing.T) {
-	m := New(config.Config{StateDir: t.TempDir(), MaxConcurrency: 4, JobTTL: time.Hour})
+	m := newManager(t, managerOpts{maxConcurrency: 4, jobTTL: time.Hour})
 	// A fresh run that exited 0 and is past the TTL, but whose conversation-id
 	// capture is still in flight: the manager's post-cmd.Wait goroutine is inside
 	// captureFreshConversationID, still writing this dir (the sentinel is already on
@@ -143,7 +143,7 @@ func TestGarbageCollectKeepsTerminalJobWithCapturePending(t *testing.T) {
 }
 
 func TestGarbageCollectRereadsSentinelBeforeRemoval(t *testing.T) {
-	m := New(config.Config{StateDir: t.TempDir(), MaxConcurrency: 4, JobTTL: time.Hour})
+	m := newManager(t, managerOpts{maxConcurrency: 4, jobTTL: time.Hour})
 	// Old enough to collect, PID 0 so processAlive is false (the process has
 	// exited). The first ExitCode read sees no sentinel; the re-read after the
 	// liveness check sees the sentinel the supervisor wrote on its way out, so the
@@ -169,7 +169,7 @@ func TestGarbageCollectRereadsSentinelBeforeRemoval(t *testing.T) {
 }
 
 func TestGarbageCollectRemovesExpired(t *testing.T) {
-	m := New(config.Config{StateDir: t.TempDir(), MaxConcurrency: 4, JobTTL: time.Hour})
+	m := newManager(t, managerOpts{maxConcurrency: 4, jobTTL: time.Hour})
 	if _, err := m.store.Create(jobstore.Meta{ID: "old", StartedAt: time.Now().Add(-2 * time.Hour)}); err != nil {
 		t.Fatal(err)
 	}
@@ -186,7 +186,7 @@ func TestGarbageCollectRemovesExpired(t *testing.T) {
 }
 
 func TestGarbageCollectUntracksSettledCapture(t *testing.T) {
-	m := New(config.Config{StateDir: t.TempDir(), MaxConcurrency: 4, JobTTL: time.Hour})
+	m := newManager(t, managerOpts{maxConcurrency: 4, jobTTL: time.Hour})
 	if _, err := m.store.Create(jobstore.Meta{ID: "old", StartedAt: time.Now().Add(-2 * time.Hour)}); err != nil {
 		t.Fatal(err)
 	}
@@ -225,7 +225,7 @@ func TestGCInterval(t *testing.T) {
 }
 
 func TestRunPeriodicGCCollectsAndStops(t *testing.T) {
-	m := New(config.Config{StateDir: t.TempDir(), MaxConcurrency: 4, JobTTL: time.Hour})
+	m := newManager(t, managerOpts{maxConcurrency: 4, jobTTL: time.Hour})
 	if _, err := m.store.Create(jobstore.Meta{ID: "old", StartedAt: time.Now().Add(-2 * time.Hour)}); err != nil {
 		t.Fatal(err)
 	}
@@ -235,17 +235,10 @@ func TestRunPeriodicGCCollectsAndStops(t *testing.T) {
 	go func() { m.runPeriodicGC(ctx, 10*time.Millisecond); close(done) }()
 
 	// The ticker collects the expired job.
-	deadline := time.Now().Add(2 * time.Second)
-	for {
+	testutil.WaitFor(t, 2*time.Second, func() bool {
 		ids, _ := m.store.List()
-		if len(ids) == 0 {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("periodic GC did not collect the expired job")
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+		return len(ids) == 0
+	}, "periodic GC did not collect the expired job")
 
 	// Cancelling the context stops the loop and returns.
 	cancel()
@@ -257,7 +250,7 @@ func TestRunPeriodicGCCollectsAndStops(t *testing.T) {
 }
 
 func TestGarbageCollectDisabledWhenTTLZero(t *testing.T) {
-	m := New(config.Config{StateDir: t.TempDir(), MaxConcurrency: 4}) // JobTTL 0
+	m := newManager(t, managerOpts{maxConcurrency: 4}) // JobTTL 0
 	if _, err := m.store.Create(jobstore.Meta{ID: "old", StartedAt: time.Now().Add(-100 * time.Hour)}); err != nil {
 		t.Fatal(err)
 	}
