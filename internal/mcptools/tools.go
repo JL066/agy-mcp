@@ -28,13 +28,19 @@ type runInput struct {
 // cannot leave a hung job uncollectable for weeks.
 const maxJobTimeout = 24 * time.Hour
 
+// ToolAgyRunSync is the agy_run_sync tool name, exported so out-of-package
+// callers (the hook-wait suppression gate) can match it against a hook payload's
+// recorded tool name with a compile-time link instead of a duplicated literal.
+const ToolAgyRunSync = "agy_run_sync"
+
 // Tool names, shared between registration (here and run_sync.go) and tests so
 // the two cannot drift.
 const (
 	toolAgyRun       = "agy_run"
 	toolAgyStatus    = "agy_status"
 	toolAgyCancel    = "agy_cancel"
-	toolAgyRunSync   = "agy_run_sync"
+	toolAgyRunSync   = ToolAgyRunSync
+	toolAgyWait      = "agy_wait"
 	toolListModels   = "list_models"
 	toolListSessions = "list_sessions"
 )
@@ -174,6 +180,7 @@ func NewServer(mgr *manager.Manager) *mcp.Server {
 	})
 
 	registerRunSync(s, mgr)
+	registerWait(s, mgr)
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name: toolListModels, Description: "List available agy models.",

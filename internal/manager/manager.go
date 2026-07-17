@@ -38,8 +38,17 @@ type Manager struct {
 	// (no id is coming): either the run is long past its timeout with no cache
 	// change, or a later same-cwd run made attribution unsafe. Settled jobs
 	// stop re-reading the cache on every Status poll.
-	settledMu      sync.Mutex
-	settledCapture map[string]struct{}
+	//
+	// concludedCapture memoizes job ids whose in-process eager capture attempt
+	// has finished. concludeCapture sets this BEFORE it clears pendingCaptures, so
+	// !CapturePending implies concluded, never the reverse (concluded can be true
+	// for a moment while pendingCaptures is still set). WaitTerminal's capture-grace
+	// exit for an in-process waiter relies on that direction. Unlike settledCapture
+	// it does NOT stop the lazy capture: a slow cache flush must still be picked up
+	// by a later Status read. Both maps share settledMu.
+	settledMu        sync.Mutex
+	settledCapture   map[string]struct{}
+	concludedCapture map[string]struct{}
 
 	// Timing for the fresh-run conversation-id capture and the restored-job
 	// liveness watcher. Fields (not package globals) so tests stay isolated and can
@@ -74,6 +83,12 @@ type Manager struct {
 	readStartTimeTicks func(int) (uint64, bool)
 }
 
+// defaultCaptureBudget bounds how long captureFreshConversationID waits for
+// agy's cache daemon to flush the new conversation id after a clean exit; it is
+// the eager (in-process) capture window. captureGraceWindow in wait.go must stay
+// strictly larger so a cross-process waiter still outlasts this budget.
+const defaultCaptureBudget = 2 * time.Second
+
 // New constructs a Manager.
 func New(c config.Config) *Manager {
 	// Prefer an explicitly configured cache path; only fall back to the default
@@ -91,10 +106,11 @@ func New(c config.Config) *Manager {
 		gate:                 newGate(c.MaxConcurrency),
 		xlock:                newCrossLock(c.StateDir),
 		cacheFile:            cacheFile,
-		captureBudget:        2 * time.Second,
+		captureBudget:        defaultCaptureBudget,
 		capturePoll:          100 * time.Millisecond,
 		restoredPollInterval: 2 * time.Second,
 		settledCapture:       make(map[string]struct{}),
+		concludedCapture:     make(map[string]struct{}),
 		readStartTimeTicks:   readStartTimeTicks,
 	}
 }
@@ -214,6 +230,26 @@ func (m *Manager) settleCapture(id string) {
 	m.settledCapture[id] = struct{}{}
 }
 
+// captureConcluded reports whether this process's eager capture attempt for a
+// job has finished. concludeCapture marks this before it clears pendingCaptures,
+// so !CapturePending implies concluded, not the reverse (concluded can be true
+// while pendingCaptures is momentarily still set). WaitTerminal reads it to end
+// an in-process waiter's grace once no more id can come from the eager path.
+// Unlike captureSettled it does not disable the lazy capture, which keeps
+// retrying on later Status reads.
+func (m *Manager) captureConcluded(id string) bool {
+	m.settledMu.Lock()
+	defer m.settledMu.Unlock()
+	_, ok := m.concludedCapture[id]
+	return ok
+}
+
+func (m *Manager) markCaptureConcluded(id string) {
+	m.settledMu.Lock()
+	defer m.settledMu.Unlock()
+	m.concludedCapture[id] = struct{}{}
+}
+
 // untrackCapture forgets a job's capture-tracking state once the job is gone
 // (garbage-collected from the store), so neither map grows without bound in a
 // long-running server. pendingCaptures is normally already cleared by the time
@@ -222,6 +258,7 @@ func (m *Manager) untrackCapture(id string) {
 	m.pendingCaptures.Delete(id)
 	m.settledMu.Lock()
 	delete(m.settledCapture, id)
+	delete(m.concludedCapture, id)
 	m.settledMu.Unlock()
 }
 
@@ -458,16 +495,11 @@ func (m *Manager) StartJob(req StartRequest) (Job, error) {
 	go func() {
 		_ = cmd.Wait()
 		_ = grp.Close()
-		// For a successful fresh run, capture the conversation id agy created
-		// while the gate key is still held, then release. Gating on exit 0 avoids
-		// waiting out the capture budget for a run that created no conversation.
-		if code, ok := m.store.ExitCode(id); ok && code == 0 {
-			m.captureFreshConversationID(&meta)
-		}
-		// Settle the capture (success or give-up) before releasing the key, so
-		// CapturePending=false means the reported status is final.
-		m.pendingCaptures.Delete(id)
-		m.releaseKey(key)
+		// Capture the conversation id agy created while the gate key is still held,
+		// then conclude and release. concludeCapture gates the capture on a clean
+		// exit and finishes the bookkeeping in the order WaitTerminal's grace exit
+		// depends on (id == meta.ID for this fresh run).
+		m.concludeCapture(&meta, key)
 	}()
 
 	return Job{ID: id, ConversationID: req.ConversationID, State: StateRunning}, nil
@@ -475,8 +507,8 @@ func (m *Manager) StartJob(req StartRequest) (Job, error) {
 
 // abortSpawn tears down a supervisor that was started but cannot be recorded as
 // a running job. It terminates the process group, then in the background reaps
-// it and — only once it has fully exited, so nothing is still writing the job
-// dir — removes the dir and releases the gate. Releasing only after the agy
+// it and, only once it has fully exited (so nothing is still writing the job
+// dir), removes the dir and releases the gate. Releasing only after the agy
 // process group is gone keeps a conflicting same-key run from starting while the
 // dying agy still holds its session lock. Both spawn-failure paths (start time
 // unreadable on darwin, and UpdateMeta failure) share it so they cannot diverge.
@@ -489,6 +521,22 @@ func (m *Manager) abortSpawn(cmd *exec.Cmd, grp *proc.Group, id, key string) {
 		m.pendingCaptures.Delete(id)
 		m.releaseKey(key)
 	}()
+}
+
+// concludeCapture finishes a completed job's capture bookkeeping: attempt the
+// eager conversation-id capture for a clean exit, mark this process's capture
+// attempt concluded, clear the pending marker, and release the job's gate key,
+// in that exact order. Conclude-before-delete is load bearing: it is what makes
+// !CapturePending imply captureConcluded for in-process waiters (WaitTerminal's
+// grace exit depends on it). Shared by both completion goroutines so a third
+// completion path cannot silently reorder it.
+func (m *Manager) concludeCapture(meta *jobstore.Meta, key string) {
+	if code, ok := m.store.ExitCode(meta.ID); ok && code == 0 {
+		m.captureFreshConversationID(meta)
+	}
+	m.markCaptureConcluded(meta.ID)
+	m.pendingCaptures.Delete(meta.ID)
+	m.releaseKey(key)
 }
 
 // loadedJob is one job's meta from a single meta.json read, the shared input the
@@ -812,14 +860,11 @@ func (m *Manager) watchRestored(meta jobstore.Meta, key string) {
 			}
 		}
 		// Mirror the StartJob completion path: a restored fresh run that exited 0
-		// still needs its conversation id captured, and like there the capture
-		// must happen while the gate key is held, so a new same-cwd run cannot
-		// overwrite the cache entry first.
-		if code, ok := m.store.ExitCode(meta.ID); ok && code == 0 {
-			m.captureFreshConversationID(&meta)
-		}
-		m.pendingCaptures.Delete(meta.ID)
-		m.releaseKey(key)
+		// still needs its conversation id captured, and like there the capture must
+		// happen while the gate key is held, so a new same-cwd run cannot overwrite
+		// the cache entry first. concludeCapture does the capture, conclusion, and
+		// release as one unit shared with StartJob.
+		m.concludeCapture(&meta, key)
 	}()
 }
 

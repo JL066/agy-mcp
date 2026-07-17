@@ -24,6 +24,7 @@ Driving `agy` from a shell for automation has two recurring problems:
 
 - `agy_run` / `agy_status` / `agy_cancel`: start an `agy` prompt, poll for completion, cancel if needed.
 - `agy_run_sync`: start a prompt and wait for it inline (bounded, with MCP progress notifications); returns the `job_id` to poll if it outlives the wait cap.
+- `agy_wait`: block until an already-started job finishes (bounded, with MCP progress notifications); one call replaces an `agy_status` poll loop.
 - `list_models`: enumerate available `agy` models.
 - `list_sessions`: list known conversations so review threads can be continued.
 
@@ -75,8 +76,9 @@ Or add to your MCP client config:
 ## Tools
 
 - `agy_run(prompt, model?, dirs?, conversation_id?, continue_latest?, cwd?, timeout?)` -> `{ job_id, conversation_id?, state }`
-- `agy_run_sync(prompt, model?, dirs?, conversation_id?, continue_latest?, cwd?, timeout?, wait?)` -> `{ job_id, state, elapsed, result?, error?, conversation_id?, note? }`
-- `agy_status(job_id)` -> `{ state, elapsed, result?, error?, conversation_id? }`
+- `agy_run_sync(prompt, model?, dirs?, conversation_id?, continue_latest?, cwd?, timeout?, wait?)` -> `{ job_id, state, elapsed, result?, error?, conversation_id?, partial?, note? }`
+- `agy_status(job_id)` -> `{ state, elapsed, result?, error?, conversation_id?, partial? }`
+- `agy_wait(job_id, wait?)` -> `{ job_id, state, elapsed, result?, error?, conversation_id?, partial?, note? }`
 - `agy_cancel(job_id)` -> `{ state }`
 - `list_models()` -> `{ models }`
 - `list_sessions(dir?)` -> `{ sessions }`
@@ -107,6 +109,42 @@ brief window, while the manager process is down, before it re-takes the locks fo
 supervisor outlived it; a sibling process that starts the same-`cwd` run during that window is not
 blocked. The in-process gate is always restored at startup, so this gap is limited to the restart
 window itself.
+
+## Completion wake for Claude Code
+
+Claude Code does not surface MCP server notifications to the model: progress notifications are UI-only, and there is no server-initiated push that can wake the model when an async job finishes. Polling `agy_status` after `agy_run` is the protocol-level baseline. agy-mcp ships a hook bridge that turns job completion into a real wake instead, built on Claude Code's `asyncRewake` hook mechanism: a background PostToolUse hook that exits with code 2 wakes the model with the hook's stderr as a system reminder.
+
+Add to your Claude Code `settings.json`:
+
+```json
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "mcp__agy__agy_run(_sync)?",
+        "hooks": [
+          { "type": "command", "command": "agy-mcp hook-wait", "asyncRewake": true, "timeout": 3700 }
+        ]
+      }
+    ]
+  }
+}
+```
+
+How it behaves:
+
+- After every `agy_run`, the hook waits (in the background, off the session's critical path) for the job's completion sentinel and then wakes Claude with a one-line message naming the `job_id` and final state, prompting the model to call `agy_status` when the result is actually ready.
+- `agy_run_sync` calls that returned their result inline produce no wake; a sync call that overran its wait cap (and so returned a still-running job) gets the same completion wake as `agy_run`.
+- On timeout (default 1h, `-timeout` to change) the hook still wakes Claude, reporting the job as still running, so a long job is never silently lost, provided the outer hook `timeout` exceeds hook-wait's own `-timeout` (see the `settings.json` note below). An externally interrupted wait (a SIGINT or SIGTERM delivered to hook-wait) also wakes, with a distinct "wait interrupted" message pointing at `agy_status`, rather than exiting silently and dropping the owed wake. On any internal error the hook exits 0 silently; it can never disrupt the tool call it observes. The hook-level `timeout` in `settings.json` (3700 above) must exceed hook-wait's own `-timeout` (1h by default), so hook-wait's internal timeout always fires first and reports the wake itself; if the outer `timeout` is equal or lower, Claude Code kills the hook process first and the exit-2 wake is lost, silently defeating that guarantee.
+- The `agy` in the matcher pattern `mcp__agy__agy_run(_sync)?` is the server name you passed to `claude mcp add agy`; if you registered the server under a different name, change both the `claude mcp add` name and that `agy` segment of the matcher.
+- Claude Code runs hooks with the user's shell environment, not the MCP server entry's own env block, so if the server is registered with a custom `AGY_MCP_STATE_DIR` the same value must also be exported in the shell (or passed inline in the hook command) or hook-wait will silently look in the wrong state directory and never wake.
+
+Two related subcommands, useful beyond Claude Code:
+
+- `agy-mcp wait-job [-timeout 1h] <job_id>` blocks until the job is terminal and prints the final state word (`done`, `failed`, or `cancelled`) to stdout. Exit codes: 0 terminal, 1 error, 2 usage, 3 timeout, 130 interrupted. It needs only the job state directory, not the agy binary, so it works in minimal environments.
+- `agy-mcp hook-wait [-timeout 1h]` is the hook entrypoint described above: it reads the PostToolUse payload from stdin, so it is not useful to invoke by hand, but it is a single self-contained binary call, no shell wrapper or jq required, and it works on Linux, macOS, and Windows. The file-based wake contract is exercised by tests on all three platforms; the signal-interrupt wake (SIGINT/SIGTERM) is a POSIX behavior and is tested there.
+
+MCP clients other than Claude Code get the same no-polling benefit in-protocol: call `agy_wait` with the `job_id` returned by `agy_run` and the tool blocks (bounded by `wait`, default 2m, max 10m) until the job finishes.
 
 ## HTTP mode
 

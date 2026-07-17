@@ -26,15 +26,22 @@ type Config struct {
 	ConversationCacheFile string
 }
 
-// Resolve builds a Config from environment variables and defaults.
-func Resolve() (Config, error) {
-	c := Config{
-		DefaultModel:   os.Getenv("AGY_MCP_DEFAULT_MODEL"),
+// baseConfig returns a Config carrying exactly the defaults shared by Resolve
+// and ResolveWait (DefaultTimeout, MaxConcurrency, JobTTL). It is the single
+// source of those defaults, so the two resolvers cannot drift apart.
+func baseConfig() Config {
+	return Config{
 		DefaultTimeout: 30 * time.Minute,
 		MaxConcurrency: 4,
 		JobTTL:         24 * time.Hour,
-		HTTPToken:      os.Getenv("AGY_MCP_HTTP_TOKEN"),
 	}
+}
+
+// Resolve builds a Config from environment variables and defaults.
+func Resolve() (Config, error) {
+	c := baseConfig()
+	c.DefaultModel = os.Getenv("AGY_MCP_DEFAULT_MODEL")
+	c.HTTPToken = os.Getenv("AGY_MCP_HTTP_TOKEN")
 
 	if p := os.Getenv("AGY_MCP_AGY_PATH"); p != "" {
 		// Resolve the override with LookPath, symmetric with the PATH branch below, so
@@ -63,25 +70,84 @@ func Resolve() (Config, error) {
 	}
 	c.AgyPath = abs
 
-	self, err := os.Executable()
+	self, err := resolveSupervisorExe()
 	if err != nil {
-		return Config{}, fmt.Errorf("resolve own executable: %w", err)
+		return Config{}, err
 	}
 	c.SupervisorExe = self
 
+	stateRoot, err := resolveStateDir()
+	if err != nil {
+		return Config{}, err
+	}
+	c.StateDir = stateRoot
+
+	return c, nil
+}
+
+// resolveStateDir returns the job-state root: AGY_MCP_STATE_DIR (made absolute)
+// or the XDG state-home fallback. Shared by Resolve and ResolveWait so the two
+// cannot drift.
+func resolveStateDir() (string, error) {
 	stateRoot := os.Getenv("AGY_MCP_STATE_DIR")
 	if stateRoot == "" {
 		xdg := os.Getenv("XDG_STATE_HOME")
 		if xdg == "" {
 			home, err := os.UserHomeDir()
 			if err != nil {
-				return Config{}, fmt.Errorf("resolve home: %w", err)
+				return "", fmt.Errorf("resolve home: %w", err)
 			}
 			xdg = filepath.Join(home, ".local", "state")
 		}
 		stateRoot = filepath.Join(xdg, "agy-mcp")
 	}
-	c.StateDir = stateRoot
+	// A relative override resolves against each process's own cwd; hook-wait runs
+	// from the session cwd while the server does not, so the same relative value
+	// would silently split the job store. Absolutize so every consumer agrees,
+	// covering both the override and the XDG fallback.
+	abs, err := filepath.Abs(stateRoot)
+	if err != nil {
+		return "", fmt.Errorf("resolve state dir %q: %w", stateRoot, err)
+	}
+	return abs, nil
+}
 
+// resolveSupervisorExe returns the path to the running agy-mcp binary, used as
+// the run-job supervisor. Shared by Resolve and ResolveWait so the two cannot
+// drift.
+func resolveSupervisorExe() (string, error) {
+	self, err := os.Executable()
+	if err != nil {
+		return "", fmt.Errorf("resolve own executable: %w", err)
+	}
+	return self, nil
+}
+
+// ResolveWait builds the minimal Config the wait-only subcommands (wait-job,
+// hook-wait) need: the state dir, defaults, and its own executable path, with
+// no agy binary lookup. Reading job status never execs agy, so requiring it on
+// PATH would be an artificial failure for a pure observer. SupervisorExe is
+// still resolved (unlike AgyPath): processAlive's fallback liveness check
+// compares a job's recorded supervisor process name against
+// m.cfg.SupervisorExe, and the wait subcommands run from the same agy-mcp
+// binary that supervises jobs in the normal single-install case, so leaving
+// it empty would make that fallback compare against filepath.Base(""), which
+// can never match a real comm value and would misreport a live job as dead.
+func ResolveWait() (Config, error) {
+	stateDir, err := resolveStateDir()
+	if err != nil {
+		return Config{}, err
+	}
+	self, err := resolveSupervisorExe()
+	if err != nil {
+		return Config{}, err
+	}
+	c := baseConfig()
+	c.StateDir = stateDir
+	c.SupervisorExe = self
+	// Cheap env reads carried for uniformity with Resolve; the wait paths do not
+	// consume them today.
+	c.DefaultModel = os.Getenv("AGY_MCP_DEFAULT_MODEL")
+	c.HTTPToken = os.Getenv("AGY_MCP_HTTP_TOKEN")
 	return c, nil
 }
