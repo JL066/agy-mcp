@@ -4,6 +4,8 @@ package supervisor
 
 import (
 	"errors"
+	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"slices"
@@ -83,6 +85,88 @@ func selectsOutputFormat(args []string) bool {
 	return slices.ContainsFunc(args, func(a string) bool {
 		return a == outputFormatFlag || strings.HasPrefix(a, outputFormatFlag+"=")
 	})
+}
+
+// markStreamJSON records, before agy is even started, that this run is being
+// driven through the stream-json event format.
+//
+// It is the durable half of ensureStreamJSON. That function may have just
+// appended the flag to a COPY of args an older manager persisted, and the
+// upgrade is deliberately never written back to meta.json: the manager rewrites
+// meta.json right after spawning this supervisor, to record the PID it needs for
+// liveness and cancel, so a second writer here would race that update and could
+// leave the job untrackable. progress.json has exactly one writer, this process,
+// which is why the marker goes here instead.
+//
+// Writing it now rather than on the first decoded event is what closes the gap.
+// The manager asks "was this a stream-json run?" to tell a run that was cut
+// short from a job an older build wrote, and answers it from the persisted args
+// first, falling back to whether a progress file exists. An upgraded job's args
+// say no; a run whose agy emitted no events at all had no progress file either,
+// so it read as legacy and its empty output was reported as a complete answer
+// rather than a cut-short one. A marker written at spawn time exists for every
+// run this supervisor drives, whether or not agy ever says anything.
+//
+// The empty Progress it writes is what every reader already handles: the
+// conversation id and step type are absent until the stream supplies them, which
+// is exactly the state a job is in before agy starts.
+//
+// It is written only for a run actually being driven through stream-json.
+// ensureStreamJSON leaves args alone when they already choose a format, so a
+// job asking for --output-format=json is exec'd as JSON and gets no marker: a
+// marker there would be a claim about a stream that is never produced.
+//
+// Withholding it loses the manager nothing, because such a job names a format
+// in its persisted args and is recognized by that signal instead. Note what it
+// does NOT rescue, though: this supervisor decodes stdout as an event stream
+// unconditionally, so a job running under any other format has its output
+// dropped by the decoder and reports an empty, partial result. Nothing here can
+// fix that, and nothing in production reaches it, since the manager's arg
+// builder only ever emits stream-json; it would take a hand-written meta.json
+// or a foreign build. Forcing stream-json over an explicit choice, or refusing
+// the job outright, are the two real options if that ever stops being true.
+//
+// The write replaces the file rather than merging into it, so it has to happen
+// before the stream drain starts. After that, consumeStream owns the file and
+// an overwrite here would erase the conversation id it recorded.
+//
+// Failure is not fatal. The marker only sharpens a heuristic that still has the
+// persisted args and the result payload to fall back on, and refusing to run
+// the job over it would trade a narrow misreport for a total one. It is noted
+// on the captured stderr rather than swallowed; note that the note lands at the
+// HEAD of that file, before agy writes a byte, so a run whose agy is loud on
+// stderr pushes it outside the tail the manager reports. In practice the branch
+// is close to unreachable: this write and the exit-code sentinel go through the
+// same helper into the same directory, so a failure here means the sentinel
+// fails too and the job is classified by the recovery path, which never
+// consults the marker at all.
+func markStreamJSON(jobDir string, errW io.Writer) {
+	if err := jobstore.WriteProgressDir(jobDir, jobstore.Progress{UpdatedAt: time.Now().UTC()}); err != nil {
+		_, _ = fmt.Fprintf(errW, "\nagy-mcp: could not record the stream-json marker: %v\n", err)
+	}
+}
+
+// selectsStreamJSON reports whether args ask agy for the event stream this
+// supervisor decodes, in either spelling the Go flag package accepts. It is the
+// narrow question markStreamJSON needs, where selectsOutputFormat asks the wide
+// one ("did the caller choose ANY format, so ensureStreamJSON must not append").
+//
+// The LAST occurrence decides, matching agy's own flag parsing, so a repeated
+// flag is read the way agy will read it rather than the way it is written.
+// ensureStreamJSON never produces a repeat, since it appends only when no
+// format is present at all, but these args can come from a meta.json some other
+// build wrote, which is the whole reason this supervisor re-checks them.
+func selectsStreamJSON(args []string) bool {
+	selected := ""
+	for i, a := range args {
+		switch {
+		case a == outputFormatFlag && i+1 < len(args):
+			selected = args[i+1]
+		case strings.HasPrefix(a, outputFormatFlag+"="):
+			selected = strings.TrimPrefix(a, outputFormatFlag+"=")
+		}
+	}
+	return selected == streamJSONFormat
 }
 
 // effectiveTimeout floors a non-positive job timeout to fallbackTimeout so the
@@ -181,7 +265,10 @@ func run(jobDir string, grace, drainWait time.Duration) error {
 	}
 	defer func() { _ = devnull.Close() }()
 
-	cmd := exec.Command(m.AgyPath, ensureStreamJSON(m.Args)...)
+	// Resolve the args once and reuse them, so the marker below is decided from
+	// exactly what agy is being run with rather than from a second guess at it.
+	args := ensureStreamJSON(m.Args)
+	cmd := exec.Command(m.AgyPath, args...)
 	cmd.Dir = m.Cwd
 	cmd.Env = os.Environ() // agy needs HOME/PATH and its OAuth/API credentials
 	cmd.Stdin = devnull
@@ -204,6 +291,10 @@ func run(jobDir string, grace, drainWait time.Duration) error {
 	// Put agy in its own process group / job so the whole tree can be terminated
 	// together on cancel or timeout.
 	proc.ConfigureGroup(cmd)
+
+	if selectsStreamJSON(args) {
+		markStreamJSON(jobDir, errF)
+	}
 
 	if err := cmd.Start(); err != nil {
 		_ = pw.Close()
