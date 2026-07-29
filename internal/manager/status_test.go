@@ -1,6 +1,7 @@
 package manager
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -9,7 +10,8 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/tphakala/agy-mcp/internal/jobstore"
+	"github.com/tphakala/agy-mcp/v2/internal/jobstore"
+	"github.com/tphakala/agy-mcp/v2/internal/streamjson"
 )
 
 // TestStatusInterruptedNoOutput: a job whose process is gone with no sentinel
@@ -63,7 +65,13 @@ func TestErrorSummaryTruncatesOnUTF8Boundary(t *testing.T) {
 func TestStatusDone(t *testing.T) {
 	m := newManager(t, managerOpts{})
 	dir, _ := m.store.Create(jobstore.Meta{ID: "j", StartedAt: time.Now(), BootID: readBootID()})
-	_ = os.WriteFile(filepath.Join(dir, "out"), []byte("the review"), 0o644)
+	writeResultPayload(t, dir, streamjson.Result{
+		ConversationID: "cid-1",
+		Status:         streamjson.StatusSuccess,
+		Response:       "the review",
+		NumTurns:       2,
+		Usage:          &streamjson.Usage{TotalTokens: 42},
+	})
 	_ = m.store.WriteExitCode("j", 0)
 
 	st, err := m.Status("j")
@@ -74,7 +82,119 @@ func TestStatusDone(t *testing.T) {
 		t.Fatalf("status = %+v", st)
 	}
 	if st.Partial {
-		t.Fatalf("a cleanly-exited job must not be marked partial: %+v", st)
+		t.Fatalf("a job with a terminal result must not be marked partial: %+v", st)
+	}
+	if st.ConversationID != "cid-1" {
+		t.Fatalf("conversation_id = %q, want cid-1 from the result payload", st.ConversationID)
+	}
+	if st.NumTurns != 2 || st.Usage == nil || st.Usage.TotalTokens != 42 {
+		t.Fatalf("accounting not surfaced: %+v", st)
+	}
+}
+
+// writeResultPayload stages the terminal result the supervisor would have
+// written for a job.
+func writeResultPayload(t *testing.T, dir string, res streamjson.Result) {
+	t.Helper()
+	b, err := json.Marshal(res)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := jobstore.WriteResultDir(dir, b); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A clean exit with no terminal result event reports whatever text streamed,
+// flagged partial: agy finished, but the answer it summarized never arrived.
+func TestStatusDoneWithoutResultIsPartial(t *testing.T) {
+	m := newManager(t, managerOpts{})
+	// Args carrying the output format mark this as a job this build started, so a
+	// missing payload really does mean the run was cut short.
+	dir, _ := m.store.Create(jobstore.Meta{
+		ID: "j", StartedAt: time.Now(), BootID: readBootID(),
+		Args: []string{outputFormatFlag, streamJSONFormat, "-p", "hi"},
+	})
+	_ = os.WriteFile(filepath.Join(dir, "out"), []byte("half an answer"), 0o644)
+	_ = m.store.WriteExitCode("j", 0)
+
+	st, err := m.Status("j")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.State != StateDone || st.Result != "half an answer" {
+		t.Fatalf("status = %+v", st)
+	}
+	if !st.Partial {
+		t.Fatalf("a job with no terminal result must be marked partial: %+v", st)
+	}
+}
+
+// A job left behind by an older agy-mcp has a complete plain-text out and no
+// result payload, because that build never wrote one. Reporting it partial would
+// tell the caller a finished answer may be truncated, for the whole TTL after an
+// upgrade.
+func TestStatusLegacyJobIsNotPartial(t *testing.T) {
+	m := newManager(t, managerOpts{})
+	// No output-format flag: the shape an older binary persisted.
+	dir, _ := m.store.Create(jobstore.Meta{
+		ID: "j", StartedAt: time.Now(), BootID: readBootID(),
+		Args: []string{"--dangerously-skip-permissions", "-p", "hi"},
+	})
+	_ = os.WriteFile(filepath.Join(dir, "out"), []byte("a complete v1 answer"), 0o644)
+	_ = m.store.WriteExitCode("j", 0)
+
+	st, err := m.Status("j")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.State != StateDone || st.Result != "a complete v1 answer" {
+		t.Fatalf("status = %+v", st)
+	}
+	if st.Partial {
+		t.Fatalf("a job from an older build must not be reported partial: %+v", st)
+	}
+}
+
+// A cancelled run never reaches a terminal result, so the text that did stream
+// is the only answer there will be. Reporting nothing would discard it.
+func TestStatusCancelledCarriesStreamedText(t *testing.T) {
+	m := newManager(t, managerOpts{})
+	dir, _ := m.store.Create(jobstore.Meta{ID: "j", StartedAt: time.Now(), BootID: readBootID()})
+	_ = os.WriteFile(filepath.Join(dir, "out"), []byte("got this far"), 0o644)
+	_ = m.store.WriteExitCode("j", jobstore.ExitSIGTERM)
+
+	st, err := m.Status("j")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.State != StateCancelled {
+		t.Fatalf("state = %q, want cancelled", st.State)
+	}
+	if st.Result != "got this far" || !st.Partial {
+		t.Fatalf("cancelled run must carry its streamed text as partial: %+v", st)
+	}
+}
+
+// A cancelled job carries no result, but it does carry the conversation, so the
+// thread it started can still be continued.
+func TestStatusCancelledKeepsConversationID(t *testing.T) {
+	m := newManager(t, managerOpts{})
+	dir, _ := m.store.Create(jobstore.Meta{ID: "j", StartedAt: time.Now(), BootID: readBootID()})
+	if err := jobstore.WriteProgressDir(dir, jobstore.Progress{ConversationID: "cid-mid-run"}); err != nil {
+		t.Fatal(err)
+	}
+	_ = m.store.WriteExitCode("j", jobstore.ExitSIGTERM)
+
+	st, err := m.Status("j")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.State != StateCancelled {
+		t.Fatalf("state = %q, want cancelled", st.State)
+	}
+	if st.ConversationID != "cid-mid-run" {
+		t.Fatalf("conversation_id = %q, want the id recorded mid-run", st.ConversationID)
 	}
 }
 
@@ -339,5 +459,51 @@ func TestStateMatchesStatusOnUnreadableCleanExit(t *testing.T) {
 	}
 	if gotState != st.State {
 		t.Fatalf("State %q disagrees with Status.State %q", gotState, st.State)
+	}
+}
+
+// A result payload whose recognized fields are all absent is indeterminate, not
+// a completed empty answer. Reading absence alone as success would hand the
+// caller "done" with nothing in it the moment agy renames or restructures those
+// fields, which is precisely what the version floor cannot prevent.
+func TestStatusEmptyResultPayloadIsNotSuccess(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		res         streamjson.Result
+		want        string
+		wantRes     string
+		wantPartial bool
+	}{
+		{"no status and no response", streamjson.Result{}, StateFailed, "", false},
+		{"no status but a response is recoverable", streamjson.Result{Response: "an answer"}, StateDone, "an answer", false},
+		{"explicit success", streamjson.Result{Status: streamjson.StatusSuccess, Response: "ok"}, StateDone, "ok", false},
+		// A status from a newer agy this build has never heard of. The run is not
+		// vouched for, so it fails, but the text it produced is handed back rather
+		// than dropped, and Partial says the caller must not trust it as final.
+		// This is the case the Result/Partial field docs and the agy_status
+		// jsonschema describe: a result present on a state that is not done.
+		{"unrecognized status keeps its response", streamjson.Result{Status: "MAX_TURNS", Response: "as far as I got"}, StateFailed, "as far as I got", true},
+		{"unrecognized status with no response", streamjson.Result{Status: "MAX_TURNS"}, StateFailed, "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newManager(t, managerOpts{})
+			dir, _ := m.store.Create(jobstore.Meta{ID: "j", StartedAt: time.Now(), BootID: readBootID()})
+			writeResultPayload(t, dir, tc.res)
+			_ = m.store.WriteExitCode("j", 0)
+
+			st, err := m.Status("j")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if st.State != tc.want || st.Result != tc.wantRes {
+				t.Fatalf("state = %q result = %q, want %q / %q", st.State, st.Result, tc.want, tc.wantRes)
+			}
+			if st.Partial != tc.wantPartial {
+				t.Fatalf("partial = %v, want %v", st.Partial, tc.wantPartial)
+			}
+			if tc.want == StateFailed && st.Error == "" {
+				t.Fatal("an indeterminate payload must carry an explanation")
+			}
+		})
 	}
 }

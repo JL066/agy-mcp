@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
-	"github.com/tphakala/agy-mcp/internal/manager"
+	"github.com/tphakala/agy-mcp/v2/internal/manager"
 )
 
 // runInput is the input for agy_run.
@@ -24,7 +24,7 @@ type runInput struct {
 	Dirs           []string `json:"dirs,omitempty" jsonschema:"extra directories to grant the agent beyond cwd (agy --add-dir), e.g. a spec or a sibling repo. The agent can read and write there exactly as under cwd, so this widens the blast radius; prefer absolute paths"`
 	ConversationID string   `json:"conversation_id,omitempty" jsonschema:"continue this specific conversation instead of starting fresh, so earlier context need not be restated; take it from a previous run's conversation_id or from list_sessions. Mutually exclusive with continue_latest"`
 	ContinueLatest bool     `json:"continue_latest,omitempty" jsonschema:"continue the most recent conversation for cwd instead of starting fresh. Mutually exclusive with conversation_id: setting this true together with a conversation_id is an error, though leaving it false alongside one is fine"`
-	Cwd            string   `json:"cwd,omitempty" jsonschema:"absolute path of the directory the agent runs in and may edit files under; also scopes continue_latest and the concurrency gate, so two fresh runs sharing a cwd conflict rather than queueing. A relative path is resolved against the server's working directory, which is not necessarily yours, so pass an absolute one. Symlinks are resolved. Defaults to the server's own working directory"`
+	Cwd            string   `json:"cwd,omitempty" jsonschema:"absolute path of the directory the agent runs in and may edit files under; also scopes continue_latest. Fresh runs sharing a cwd run concurrently. A relative path is resolved against the server's working directory, which is not necessarily yours, so pass an absolute one. Symlinks are resolved. Defaults to the server's own working directory"`
 	Timeout        string   `json:"timeout,omitempty" jsonschema:"max wall-clock duration for the whole run (Go duration, e.g. 20m); a value over 24h is rejected. On expiry the agy process tree is killed and the job ends in state failed. Omit to use the server's default"`
 }
 
@@ -129,7 +129,7 @@ func (in runInput) toStartRequest() (manager.StartRequest, error) {
 
 type runOutput struct {
 	JobID          string `json:"job_id" jsonschema:"handle for this run; pass it to agy_wait, agy_status or agy_cancel"`
-	ConversationID string `json:"conversation_id,omitempty" jsonschema:"conversation this run belongs to; empty on a fresh run until agy assigns one, which agy_status reports once known"`
+	ConversationID string `json:"conversation_id,omitempty" jsonschema:"conversation this run belongs to; pass it back as conversation_id to continue the thread. Rarely empty on a fresh run, when agy had not yet named the conversation; agy_status reports it moments later"`
 	State          string `json:"state" jsonschema:"always running: the job has been started and cannot have finished yet. Block with agy_wait or check agy_status for the outcome"`
 }
 
@@ -138,27 +138,58 @@ type statusInput struct {
 }
 
 type statusOutput struct {
-	State          string `json:"state" jsonschema:"running, done, failed or cancelled; only done carries a result"`
+	State          string `json:"state" jsonschema:"running, done, failed or cancelled"`
 	Elapsed        string `json:"elapsed" jsonschema:"wall-clock time the job has run, frozen at completion once terminal"`
-	Result         string `json:"result,omitempty" jsonschema:"the delegated agent's output; present only when state is done"`
+	Result         string `json:"result,omitempty" jsonschema:"the delegated agent's output. Set whenever the run produced any text, so a failed or cancelled job can carry one too; read it in those states rather than discarding it, but check partial first"`
 	Error          string `json:"error,omitempty" jsonschema:"why the job failed; present only when state is failed"`
 	ConversationID string `json:"conversation_id,omitempty" jsonschema:"conversation this run belongs to; pass it back as conversation_id to continue the thread"`
-	// Partial is set when a done job's result was recovered without a completion
-	// sentinel and so may be truncated; see manager.Status.Partial.
-	Partial bool `json:"partial,omitempty" jsonschema:"true when the result was recovered without a completion sentinel and may be truncated; treat the output as incomplete"`
+	// Partial marks a result that is not a verified final answer; see
+	// manager.Status.Partial.
+	Partial bool `json:"partial,omitempty" jsonschema:"true when result is not the verified final answer, because agy never reported a terminal result and the text was reconstructed from the stream, or because it reported an outcome this build does not recognize; treat the result as incomplete"`
+	// NumTurns and Usage are agy's own accounting, present once the run reported
+	// a terminal result.
+	NumTurns int          `json:"num_turns,omitempty" jsonschema:"how many turns the conversation has taken, as reported by agy"`
+	Usage    *usageOutput `json:"usage,omitempty" jsonschema:"token accounting for the run, as reported by agy"`
+	// StepType answers "what is it doing" for a running job, which is the whole
+	// point of polling one. It reaches the wire as well as the progress
+	// notification because Claude Code never surfaces notifications to the model.
+	StepType string `json:"step_type,omitempty" jsonschema:"what agy is doing right now (for example agent_response or a tool call), for a running job; a hint that lags by up to one poll"`
+}
+
+// usageOutput mirrors agy's usage object on the wire. It is declared here rather
+// than reusing the streamjson type so the tool schema owns its own field
+// documentation.
+type usageOutput struct {
+	InputTokens     int `json:"input_tokens" jsonschema:"prompt tokens billed for this run"`
+	OutputTokens    int `json:"output_tokens" jsonschema:"tokens generated, including thinking"`
+	ThinkingTokens  int `json:"thinking_tokens" jsonschema:"the share of output tokens spent on reasoning"`
+	CacheReadTokens int `json:"cache_read_tokens" jsonschema:"prompt tokens served from the provider's cache"`
+	TotalTokens     int `json:"total_tokens" jsonschema:"input plus output tokens"`
 }
 
 // toStatusOutput converts a manager status into its wire shape, shared by
 // agy_status, agy_run_sync and agy_wait so they cannot drift.
 func toStatusOutput(st manager.Status) statusOutput {
-	return statusOutput{
+	out := statusOutput{
 		State:          st.State,
 		Elapsed:        st.Elapsed.Round(time.Second).String(),
 		Result:         st.Result,
 		Error:          st.Error,
 		ConversationID: st.ConversationID,
 		Partial:        st.Partial,
+		NumTurns:       st.NumTurns,
+		StepType:       st.StepType,
 	}
+	if u := st.Usage; u != nil {
+		out.Usage = &usageOutput{
+			InputTokens:     u.InputTokens,
+			OutputTokens:    u.OutputTokens,
+			ThinkingTokens:  u.ThinkingTokens,
+			CacheReadTokens: u.CacheReadTokens,
+			TotalTokens:     u.TotalTokens,
+		}
+	}
+	return out
 }
 
 type cancelInput struct {
@@ -208,13 +239,13 @@ const serverInstructions = `agy delegates a prompt to a background coding agent 
 
 Choosing a tool:
 - agy_run_sync starts a run and waits inline (bounded by the wait argument). Use it when you need the answer before your next step and the task is bounded enough to finish within that wait.
-- agy_run returns a job_id immediately; block on it with agy_wait or poll it with agy_status. Use these for long runs, for open-ended work that routinely outlives an inline wait (web research, a large review), or to fan several tasks out in parallel.
+- agy_run returns a job_id in under a couple of seconds (it waits briefly for agy to name the conversation); block on it with agy_wait or poll it with agy_status. Use these for long runs, for open-ended work that routinely outlives an inline wait (web research, a large review), or to fan several tasks out in parallel.
 - Outliving the inline wait is not a failure: the job keeps running under its own supervisor and the returned job_id still resolves to its outcome. Wait on it or poll it; do not re-send the prompt.
 - list_models enumerates models; call it only if you want to override the default. list_sessions lists known conversations.
 
 Notes:
 - Continue a prior thread with conversation_id or continue_latest instead of restating context.
-- Fresh runs sharing a cwd are not queued; a concurrent attempt returns a conflict error. To run tasks in parallel, continue an existing conversation or use a different directory.
+- Fan out freely: fresh runs in the same directory run concurrently, up to the server's concurrency cap. Only two runs continuing the SAME conversation_id conflict, and the second is refused rather than queued.
 - agy runs a full agent that can edit files. For a review that must not touch the repo, say so explicitly in the prompt.
 - Always reconcile a backgrounded run: poll it to completion and fold the result back in.`
 

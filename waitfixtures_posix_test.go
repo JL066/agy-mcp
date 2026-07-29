@@ -9,9 +9,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/tphakala/agy-mcp/internal/config"
-	"github.com/tphakala/agy-mcp/internal/manager"
-	"github.com/tphakala/agy-mcp/internal/testutil"
+	"github.com/tphakala/agy-mcp/v2/internal/config"
+	"github.com/tphakala/agy-mcp/v2/internal/manager"
+	"github.com/tphakala/agy-mcp/v2/internal/testutil"
 )
 
 // startRunningJobForWait starts a real job under a fake agy that sleeps for the
@@ -40,8 +40,11 @@ func startRunningJobForWait(t *testing.T, sleep time.Duration, convLabel string,
 		CacheJSON: fmt.Sprintf(`{%q:%q}`, cwd, convLabel),
 	})
 	stateDir := t.TempDir()
+	// ConversationIDWait 0: this fake supervisor writes no progress file, so StartJob
+	// would sleep out the whole default budget on every start, which for a short
+	// fake agy is long enough for the job to finish before StartJob even returns.
 	c := config.Config{AgyPath: agy, SupervisorExe: sup, StateDir: stateDir,
-		DefaultTimeout: time.Minute, MaxConcurrency: 4,
+		DefaultTimeout: time.Minute, MaxConcurrency: 4, ConversationIDWait: 0,
 		ConversationCacheFile: cachePath}
 	mgr := manager.New(c)
 
