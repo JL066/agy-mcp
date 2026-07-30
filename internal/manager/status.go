@@ -1,6 +1,7 @@
 package manager
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -40,10 +41,22 @@ const (
 type Status struct {
 	State   string // running | done | failed | cancelled
 	Elapsed time.Duration
-	// Result is the assistant's response. It is set whenever the job produced
-	// any text, which is NOT only when State is done: a cancelled, timed-out or
-	// crashed run carries whatever it managed to say, so that work is offered
-	// back rather than discarded. Consult Partial before treating it as final.
+	// Result is the assistant's response. Every TERMINAL state whose text can be
+	// RECOVERED carries one, not done alone: a cancelled, timed-out or crashed
+	// run carries whatever it managed to say, so that work is offered back rather
+	// than discarded. Recoverable is the operative word, since text can exist on
+	// disk and still not be readable: that leaves this empty, reported as an Error
+	// where the read was the only possible source of an answer
+	// (cleanExitWithoutPayload, recoverInterrupted) and passed over silently where
+	// the state was already decided without it (carryText). Consult Partial before
+	// treating it as final.
+	//
+	// A running job deliberately reports none, even once it has streamed text.
+	// Status returns above without reading the out file while the job is live,
+	// which is what makes polling one cheap (the agy_status tool description
+	// promises exactly that); reading per tick would re-read a growing file, and
+	// mid-stream text is not an answer. Collect a result once the state is
+	// terminal.
 	Result         string
 	Error          string // present when failed: agy's own message, or a stderr tail + exit code
 	ConversationID string
@@ -67,6 +80,9 @@ type Status struct {
 	Usage    *streamjson.Usage
 	// StepType names the stream step the job is on, for progress reporting. It
 	// is a hint: empty until the first step arrives, and stale by up to one poll.
+	// It is read from progress.json before the exit-code sentinel is consulted,
+	// so a terminal job keeps the last step it recorded rather than clearing it;
+	// only a running job's is current.
 	StepType string
 }
 
@@ -516,6 +532,16 @@ func (m *Manager) frozenElapsed(meta jobstore.Meta, running time.Duration) time.
 // maxReadBytes. A missing file yields "" with no error: a job may legitimately
 // have produced no output. Any other error is returned so callers can tell an
 // unreadable file (report a failure) from an empty one (a clean empty result).
+//
+// The read is pre-sized from the file's own size, so a large out file is not
+// rebuilt by the grow-and-copy an unsized io.ReadAll performs. What pays for
+// this is the fallback paths rather than every terminal status: a run whose
+// terminal payload carried a response is answered from that and never opens out
+// at all (see carryText). The callers that do open it are the runs cut short,
+// the recovered ones, and a legacy job dir, and those are polled like any other.
+// The size is only a hint: the LimitReader still owns the cap (so an out over it
+// is truncated, not read whole), and the buffer still grows on its own if the
+// file changed since the Stat.
 func readFile(p string) (string, error) {
 	f, err := os.Open(p)
 	if errors.Is(err, fs.ErrNotExist) {
@@ -525,11 +551,25 @@ func readFile(p string) (string, error) {
 		return "", err
 	}
 	defer func() { _ = f.Close() }()
-	b, err := io.ReadAll(io.LimitReader(f, maxReadBytes))
-	if err != nil {
+	var buf bytes.Buffer
+	// Pre-size from the file's own size, plus bytes.MinRead of headroom. The
+	// headroom is what keeps ReadFrom's last pass from reallocating: it grows by
+	// MinRead before every read, which is a free reslice while that much spare
+	// capacity remains and a full grow-and-copy once it is not. That applies to
+	// an oversized file too, so this deliberately reserves MinRead more than the
+	// LimitReader can ever deliver; reserving exactly maxReadBytes instead buys
+	// back those 512 bytes and pays a 32 MiB copy to discover EOF (measured on a
+	// file over the cap: 100.7 MB allocated per read against 33.6 MB, and 3.5ms
+	// against 2.4ms). A Stat failure costs only the pre-sizing, so it is not
+	// reported; a zero or negative size skips it (Grow panics on a negative
+	// argument).
+	if info, serr := f.Stat(); serr == nil && info.Size() > 0 {
+		buf.Grow(int(min(info.Size(), maxReadBytes) + bytes.MinRead))
+	}
+	if _, err := buf.ReadFrom(io.LimitReader(f, maxReadBytes)); err != nil {
 		return "", err
 	}
-	return strings.TrimRight(string(b), "\n"), nil
+	return strings.TrimRight(buf.String(), "\n"), nil
 }
 
 // tailFile returns the last n bytes of the file at path. Unlike a LimitReader
