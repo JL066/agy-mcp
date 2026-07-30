@@ -70,8 +70,13 @@ type Result struct {
 	Usage           *Usage  `json:"usage,omitempty"`
 }
 
-// Event is one decoded line of the stream. Exactly one payload pointer is set,
-// matching Kind.
+// Event is one decoded line of the stream. agy sets exactly one payload pointer,
+// matching Kind, and nothing here validates that, so production consumers
+// nil-check the pointer for the kind they handle instead of trusting Kind on its
+// own. An event whose pointer does not match its Kind is neither skipped nor
+// counted in Malformed: Next returns it and the consumer's nil check drops it
+// silently. A line is skipped and counted only when it fails to decode or when it
+// overruns maxLineBytes, which is checked before any decode is attempted.
 type Event struct {
 	Kind string `json:"event"`
 	// ConversationID is carried at the top level on the init event; the other
@@ -126,7 +131,19 @@ func NewReader(r io.Reader) *Reader {
 // is readable at any point and is final once Next has returned an error.
 func (r *Reader) Malformed() int { return r.malformed }
 
-// Next returns the next decodable event, or io.EOF at end of stream.
+// Next returns the next decodable event, io.EOF at a clean end of stream, or a read
+// error, so a stream torn off mid-run is reported as the failure it is rather than
+// passed off as a finished one. Along the way it skips blank lines silently, and
+// skips undecodable and over-long lines after counting them in Malformed.
+//
+// A read error arriving on the same call as a decodable event is DEFERRED rather
+// than returned with it: the event comes back first, which is what io.Reader asks
+// of a caller (process the bytes, then consider the error), and the next call
+// reports the failure. Nothing is swallowed. Measured both ways: a reader that
+// repeats its error (a torn pipe) yields it again, and one that falls silent yields
+// io.ErrNoProgress. The case is narrow anyway, since bufio hands back a buffered
+// whole line with a nil error and keeps the error for the following read, so the
+// two only coincide when the tear lands on a line with no terminator.
 func (r *Reader) Next() (Event, error) {
 	for {
 		line, truncated, err := r.readLine()
@@ -161,9 +178,17 @@ func (r *Reader) Next() (Event, error) {
 }
 
 // readLine reads one newline-terminated line, growing past bufio's internal
-// buffer. It returns the line without its terminator, whether the line exceeded
-// maxLineBytes (in which case the overflow is discarded and the retained prefix
-// must not be decoded), and the terminating error if any.
+// buffer. It returns the line with its terminator still attached whenever the line
+// came back whole, whether the line exceeded maxLineBytes (in which case the
+// overflow is discarded and the retained prefix must not be decoded), and the
+// terminating error if any. Two reachable paths carry no terminator: a stream that
+// ends mid-line, and a truncated line, whose newline sits in the discarded
+// overflow.
+//
+// Nothing here strips it, because nothing needs it stripped: Next trims
+// surrounding space before decoding, which removes the terminator along with a
+// stray \r from a Windows-written stream, and json.Unmarshal would ignore trailing
+// whitespace regardless.
 //
 // bufio.Scanner is deliberately not used: it fails the whole stream with
 // ErrTooLong on a single over-long line, which would drop every later event
