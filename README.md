@@ -9,7 +9,7 @@
 
 An MCP (Model Context Protocol) server that wraps the [Antigravity CLI](https://antigravity.google) (`agy`), so any MCP client (Claude Code, Cursor, Cline, and others) can run `agy` prompts, peer reviews, and follow-up turns as native tools.
 
-> Status: feature complete (stdio and HTTP transports, async and sync job lifecycle, model and session discovery, cross-platform builds) and verified against a live agy (1.1.10), which is also the floor.
+> Status: feature complete (stdio and HTTP transports, async and sync job lifecycle, model and session discovery, per-run controls and structured output, cross-platform builds) and verified against a live agy (1.1.10), which is also the floor.
 
 ## Why
 
@@ -29,6 +29,8 @@ Every job runs `agy --output-format stream-json`, and the supervisor decodes tha
 - `agy_wait`: block until an already-started job finishes (bounded, with MCP progress notifications); one call replaces an `agy_status` poll loop.
 - `list_models`: enumerate available `agy` models.
 - `list_sessions`: list known conversations so review threads can be continued.
+
+`agy_run` and `agy_run_sync` also take optional per-run controls, each forwarded to `agy` only when set: pick the `model`, reasoning `effort` (`low`/`medium`/`high`), execution `mode` (including a `plan`-only pass), a named `agent`, `sandbox` terminal restrictions, and a `json_schema` to constrain the result to structured output.
 
 Session continuation rides `agy`'s own durable conversation store (`--conversation <id>`), so threads survive across calls without keeping a process warm.
 
