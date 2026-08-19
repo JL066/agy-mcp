@@ -4,7 +4,7 @@
 [![CodeQL](https://github.com/tphakala/agy-mcp/actions/workflows/codeql.yml/badge.svg)](https://github.com/tphakala/agy-mcp/actions/workflows/codeql.yml)
 [![Version](https://img.shields.io/github/v/tag/tphakala/agy-mcp?label=version&sort=semver)](https://github.com/tphakala/agy-mcp/tags)
 [![Go Reference](https://pkg.go.dev/badge/github.com/tphakala/agy-mcp/v2.svg)](https://pkg.go.dev/github.com/tphakala/agy-mcp/v2)
-[![Go Report Card](https://goreportcard.com/badge/github.com/tphakala/agy-mcp/v2)](https://goreportcard.com/report/github.com/tphakala/agy-mcp/v2)
+[![Coverage](https://codecov.io/gh/tphakala/agy-mcp/branch/main/graph/badge.svg)](https://codecov.io/gh/tphakala/agy-mcp)
 [![License: MIT](https://img.shields.io/github/license/tphakala/agy-mcp)](LICENSE)
 
 An MCP (Model Context Protocol) server that wraps the [Antigravity CLI](https://antigravity.google) (`agy`), so any MCP client (Claude Code, Cursor, Cline, and others) can run `agy` prompts, peer reviews, and follow-up turns as native tools.
