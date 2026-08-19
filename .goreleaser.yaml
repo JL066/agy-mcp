@@ -27,3 +27,16 @@ changelog:
       - '^ci:'
       - '^docs?:'
       - '^README'
+brews:
+  - repository:
+      owner: tphakala
+      name: homebrew-tap
+      branch: main
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    directory: Formula
+    homepage: "https://github.com/tphakala/agy-mcp"
+    description: "Model Context Protocol (MCP) server for Google Antigravity CLI (agy)"
+    license: "MIT"
+    test: |
+      system "#{bin}/agy-mcp", "-h"
+

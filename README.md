@@ -73,6 +73,14 @@ Two transports run the same core:
 
 ## Install
 
+### Homebrew (macOS / Linux)
+
+```bash
+brew install tphakala/tap/agy-mcp
+```
+
+### Go install
+
 ```bash
 go install github.com/tphakala/agy-mcp/v2@latest
 ```
