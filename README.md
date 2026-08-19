@@ -79,6 +79,8 @@ Two transports run the same core:
 brew install tphakala/tap/agy-mcp
 ```
 
+This installs the prebuilt release binary (macOS and Linux, amd64 and arm64) from [tphakala/homebrew-tap](https://github.com/tphakala/homebrew-tap); upgrade later with `brew upgrade agy-mcp`. The tap formula is regenerated on every release, so upgrades track new versions as they ship.
+
 ### Go install
 
 ```bash
