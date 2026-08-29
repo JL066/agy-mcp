@@ -23,10 +23,10 @@ func ensureSysProcAttr(cmd *exec.Cmd) {
 // ConfigureGroup marks the spawned process as the root of a new process group so
 // it is isolated from the parent's console control events. The supervisor uses it
 // for agy; the process tree is actually terminated via the Job Object captured by
-// Track. It ORs the flag into any CreationFlags a caller set first.
+// Track. It ORs the flags into any CreationFlags a caller set first.
 func ConfigureGroup(cmd *exec.Cmd) {
 	ensureSysProcAttr(cmd)
-	cmd.SysProcAttr.CreationFlags |= windows.CREATE_NEW_PROCESS_GROUP
+	cmd.SysProcAttr.CreationFlags |= windows.CREATE_NEW_PROCESS_GROUP | windows.CREATE_NO_WINDOW
 }
 
 // StartDetached configures cmd so the spawned supervisor is detached from the

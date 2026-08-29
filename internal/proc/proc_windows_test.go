@@ -35,6 +35,9 @@ func TestConfigureGroupSetsNewProcessGroup(t *testing.T) {
 	if cmd.SysProcAttr == nil || cmd.SysProcAttr.CreationFlags&windows.CREATE_NEW_PROCESS_GROUP == 0 {
 		t.Fatal("ConfigureGroup must set CREATE_NEW_PROCESS_GROUP")
 	}
+	if cmd.SysProcAttr.CreationFlags&windows.CREATE_NO_WINDOW == 0 {
+		t.Fatal("ConfigureGroup must set CREATE_NO_WINDOW")
+	}
 }
 
 func TestConfigureGroupPreservesExistingFlags(t *testing.T) {
