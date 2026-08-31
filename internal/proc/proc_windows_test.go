@@ -42,9 +42,11 @@ func TestConfigureGroupSetsNewProcessGroup(t *testing.T) {
 
 func TestConfigureGroupPreservesExistingFlags(t *testing.T) {
 	cmd := exec.Command("cmd.exe", "/c", "exit")
-	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
+	// The sentinel has to be a flag ConfigureGroup does not set itself, otherwise
+	// the check passes even when CreationFlags is overwritten rather than ORed.
+	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: windows.CREATE_DEFAULT_ERROR_MODE}
 	ConfigureGroup(cmd)
-	if cmd.SysProcAttr.CreationFlags&windows.CREATE_NO_WINDOW == 0 {
+	if cmd.SysProcAttr.CreationFlags&windows.CREATE_DEFAULT_ERROR_MODE == 0 {
 		t.Error("ConfigureGroup must preserve a pre-existing CreationFlag")
 	}
 	if cmd.SysProcAttr.CreationFlags&windows.CREATE_NEW_PROCESS_GROUP == 0 {
